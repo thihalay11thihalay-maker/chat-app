@@ -1,16 +1,17 @@
 import { getApp, getApps, initializeApp } from 'firebase/app';
 import {
-  Auth,
-  ConfirmationResult,
-  createUserWithEmailAndPassword,
-  signInWithPhoneNumber as firebaseSignInWithPhoneNumber,
-  getAuth,
-  GoogleAuthProvider,
-  RecaptchaVerifier,
-  signInWithEmailAndPassword,
-  signInWithPopup,
+    Auth,
+    ConfirmationResult,
+    createUserWithEmailAndPassword,
+    signInWithPhoneNumber as firebaseSignInWithPhoneNumber,
+    getAuth,
+    GoogleAuthProvider,
+    RecaptchaVerifier,
+    signInWithEmailAndPassword,
+    signInWithPopup,
 } from 'firebase/auth';
 import { Firestore, getFirestore } from 'firebase/firestore';
+import { FirebaseStorage, getStorage } from 'firebase/storage';
 import { Platform } from 'react-native';
 
 const firebaseConfig = {
@@ -24,34 +25,58 @@ const firebaseConfig = {
 
 let auth: Auth | null = null;
 let firestore: Firestore | null = null;
+let storage: FirebaseStorage | null = null;
 let recaptchaVerifier: RecaptchaVerifier | null = null;
 
 export function isFirebaseConfigured() {
-  return Object.values(firebaseConfig).every(Boolean);
+  return Boolean(
+    firebaseConfig.apiKey
+      && firebaseConfig.authDomain
+      && firebaseConfig.projectId
+      && firebaseConfig.messagingSenderId
+      && firebaseConfig.appId,
+  );
+}
+
+export function isFirebaseStorageConfigured() {
+  return Boolean(firebaseConfig.storageBucket);
+}
+
+function assertFirebaseConfigured(message: string) {
+  if (!isFirebaseConfigured()) {
+    throw new Error(message);
+  }
+}
+
+function getFirebaseApp() {
+  assertFirebaseConfigured('Firebase is not configured. Add the EXPO_PUBLIC_FIREBASE values to .env.');
+
+  return getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 }
 
 export function getFirebaseAuth() {
   if (auth) return auth;
 
-  if (!isFirebaseConfigured()) {
-    throw new Error('Firebase is not configured. Add the EXPO_PUBLIC_FIREBASE values to .env.');
-  }
-
-  const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-  auth = getAuth(app);
+  auth = getAuth(getFirebaseApp());
   return auth;
 }
 
 export function getFirebaseDb() {
   if (firestore) return firestore;
 
-  if (!isFirebaseConfigured()) {
-    throw new Error('Firebase is not configured. Add the EXPO_PUBLIC_FIREBASE values to .env.');
+  firestore = getFirestore(getFirebaseApp());
+  return firestore;
+}
+
+export function getFirebaseStorage() {
+  if (storage) return storage;
+
+  if (!isFirebaseStorageConfigured()) {
+    throw new Error('Firebase Storage is not configured.');
   }
 
-  const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-  firestore = getFirestore(app);
-  return firestore;
+  storage = getStorage(getFirebaseApp());
+  return storage;
 }
 
 export function signUpWithEmail(email: string, password: string) {

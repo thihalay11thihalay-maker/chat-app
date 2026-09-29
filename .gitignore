@@ -28,6 +28,12 @@ npm-debug.*
 yarn-debug.*
 yarn-error.*
 
+# dev server output
+web.log
+web.out.log
+web.err.log
+*.log
+
 # macOS
 .DS_Store
 *.pem

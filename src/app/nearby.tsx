@@ -24,6 +24,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
+import { getCoordinates, getString, readNumber, UserData } from '@/lib/user-data';
 
 type NearbyUser = {
   id: string;
@@ -35,38 +36,11 @@ type NearbyUser = {
   profilePictureUrl?: string;
 };
 
-type UserProfile = Record<string, unknown>;
+type UserProfile = UserData;
 
 const SEARCH_RADIUS_KM = 50;
 const MIN_AGE = 18;
 const MAX_AGE = 80;
-
-function readNumber(profile: UserProfile, ...keys: string[]) {
-  for (const key of keys) {
-    const value = profile[key];
-    if (typeof value === 'number' && Number.isFinite(value)) {
-      return value;
-    }
-    if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) {
-      return Number(value);
-    }
-  }
-
-  return null;
-}
-
-function readString(profile: UserProfile, key: string, fallback: string) {
-  return typeof profile[key] === 'string' && profile[key]
-    ? String(profile[key])
-    : fallback;
-}
-
-function getCoordinates(profile: UserProfile) {
-  const latitude = readNumber(profile, 'latitude', 'lat');
-  const longitude = readNumber(profile, 'longitude', 'lng', 'lon');
-
-  return latitude !== null && longitude !== null ? [latitude, longitude] as [number, number] : null;
-}
 
 export default function NearbyScreen() {
   const [nearbyUsers, setNearbyUsers] = useState<NearbyUser[]>([]);
@@ -109,9 +83,9 @@ export default function NearbyScreen() {
 
         usersById.set(userDocument.id, {
           age: userAge,
-          city: readString(profile, 'city', 'Location unavailable'),
+          city: getString(profile, ['city'], 'Location unavailable'),
           distanceKm,
-          displayName: readString(profile, 'displayName', 'Nearby friend'),
+          displayName: getString(profile, ['displayName'], 'Nearby friend'),
           id: userDocument.id,
           isOnline: profile.isOnline === true,
           profilePictureUrl: typeof profile.profilePictureUrl === 'string'

@@ -1,0 +1,114 @@
+rules_version = '2';
+
+// Firestore security rules for the chat app.
+//
+// Data model used by the client:
+//   users/{uid}                     - profile + geohash/latitude/longitude
+//   users/{uid}/following/{userId}  - who this user follows
+//   posts/{postId}                  - feed posts
+//   posts/{postId}/reactions/{uid}  - { liked, loved } per reacting user
+//   chats/{chatId}                  - participants[] (uids), lastMessage, ...
+//   chats/{chatId}/messages/{msgId} - senderId, type, text/mediaUrl
+//
+// The reactions subcollection replaced the earlier users/{uid}/likes and /loves documents,
+// which are no longer read or written. They can be deleted from Firestore once no client
+// depends on them.
+//
+// Deploy with:  firebase deploy --only firestore:rules
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // A chat document is visible/writable only to the users listed in participants.
+    function isChatParticipant(chatId) {
+      return isSignedIn()
+        && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+    }
+
+    // ---------------------------------------------------------------- users
+    match /users/{uid} {
+      // Any signed-in user may read a profile: the chat list shows the other
+      // participant's name/avatar, and find-friends reads age/city/geohash.
+      allow get, list: if isSignedIn();
+
+      allow create: if isOwner(uid);
+
+      // A user may edit only their own document.
+      allow update: if isOwner(uid);
+      allow delete: if isOwner(uid);
+
+      // Following is a per-author marker. Without this match every read fell through to the
+      // deny-all rule below.
+      match /following/{followedId} {
+        allow get, list: if isOwner(uid);
+        allow create, delete: if isOwner(uid);
+        allow update: if false;
+      }
+    }
+
+    // ---------------------------------------------------------------- posts
+    match /posts/{postId} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if isSignedIn();
+
+      // One document per reacting user, holding both the liked and loved flags. The feed
+      // counts these documents with a collection listener instead of keeping a counter on
+      // the post, so the numbers can never drift from the reactions themselves.
+      //
+      // list is deliberately not scoped to the owner: Firestore denies a collection query
+      // unless the rule allows it for every document, so scoping it to userId would break
+      // counting. Read access is therefore open to any signed-in user, which is the same
+      // information the published count already implies.
+      match /reactions/{userId} {
+        allow get: if isSignedIn() && request.auth.uid == userId;
+        allow list: if isSignedIn();
+        allow create, update: if isSignedIn() && request.auth.uid == userId;
+        allow delete: if isSignedIn() && request.auth.uid == userId;
+      }
+    }
+
+    // ---------------------------------------------------------------- chats
+    match /chats/{chatId} {
+      allow get: if isChatParticipant(chatId);
+      allow list: if isSignedIn();
+
+      // The caller must be one of the two participants. The participant list is
+      // sorted before it is written, so the creator is not necessarily [0].
+      allow create: if isSignedIn()
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() == 2
+        && request.auth.uid in request.resource.data.participants;
+
+      // Participant list is immutable, so nobody can add themselves to a chat later.
+      allow update: if isChatParticipant(chatId)
+        && request.resource.data.participants == resource.data.participants;
+
+      allow delete: if isChatParticipant(chatId);
+
+      // ------------------------------------------------------------ messages
+      match /messages/{messageId} {
+        allow get, list: if isChatParticipant(chatId);
+
+        allow create: if isChatParticipant(chatId)
+          && request.resource.data.senderId == request.auth.uid;
+
+        // A sender may fix or retract their own message; nobody edits someone else's.
+        allow update, delete: if isChatParticipant(chatId)
+          && resource.data.senderId == request.auth.uid;
+      }
+    }
+
+    // Anything not matched above is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

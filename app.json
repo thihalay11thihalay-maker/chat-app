@@ -11,7 +11,7 @@
       "icon": "./assets/expo.icon",
       "infoPlist": {
         "NSCameraUsageDescription": "Allow Convo to use your camera for video calls.",
-        "NSMicrophoneUsageDescription": "Allow Convo to use your microphone for calls."
+        "NSMicrophoneUsageDescription": "Allow Convo to use your microphone for calls and audio messages."
       }
     },
     "android": {
@@ -27,11 +27,12 @@
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION"
       ],
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.thiha11thiha.chatappnew"
     },
     "web": {
-      "output": "static",
-      "favicon": "./assets/images/favicon.png"
+      "favicon": "./assets/images/favicon.png",
+      "output": "static"
     },
     "plugins": [
       "expo-router",
@@ -44,7 +45,17 @@
           "imageWidth": 76
         }
       ],
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow Convo to record and send audio messages.",
+          "enableBackgroundPlayback": false,
+          "enableBackgroundRecording": false
+        }
+      ],
+      "expo-video",
+      "expo-asset"
     ],
     "experiments": {
       "typedRoutes": true,

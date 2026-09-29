@@ -6,9 +6,9 @@ export default function CallScreen() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.centerState}>
-        <Text style={styles.title}>Video calls are unavailable on web</Text>
+        <Text style={styles.title}>Video calls are unavailable on this build</Text>
         <Text style={styles.text}>
-          This feature requires an iOS or Android development build because it uses native Agora video support.
+          Native video calling is unavailable in this project build until the platform-specific Agora setup is restored.
         </Text>
         <Pressable accessibilityRole="button" onPress={() => router.back()} style={styles.backButton}>
           <Text style={styles.backButtonText}>Go back</Text>

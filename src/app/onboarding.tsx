@@ -1,20 +1,20 @@
 import DateTimePicker, {
-    DateTimePickerEvent,
+  DateTimePickerEvent,
 } from '@react-native-community/datetimepicker';
 import { router } from 'expo-router';
 import { doc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { useState } from 'react';
 import {
-    Alert,
-    Image,
-    KeyboardAvoidingView,
-    Platform,
-    Pressable,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    View,
+  Alert,
+  Image,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -103,7 +103,7 @@ export default function OnboardingScreen() {
         userId: user.uid,
       }, { merge: true });
 
-      router.replace('/chat');
+      router.replace('/chat' as never);
     } catch (error) {
       Alert.alert(
         'Could not save profile',
@@ -279,8 +279,8 @@ export default function OnboardingScreen() {
                 onPress={handleSave}
                 style={({ pressed }) => [styles.saveButton, pressed && styles.pressed]}
               >
-                <Text style={styles.saveButtonText}>
-                  {isSaving ? 'Saving...' : 'Save &amp; Continue'}
+                                <Text style={styles.saveButtonText}>
+                  {isSaving ? 'Saving...' : 'Save & Continue'}
                 </Text>
                 <Text style={styles.buttonArrow}>{'->'}</Text>
               </Pressable>

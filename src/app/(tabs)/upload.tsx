@@ -1,12 +1,14 @@
 import { Ionicons } from '@expo/vector-icons';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { decode } from 'base64-arraybuffer';
+import { CameraType, CameraView, FlashMode, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
+import { useVideoPlayer, VideoView } from 'expo-video';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { addDoc, collection, doc, getDoc, serverTimestamp } from 'firebase/firestore';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -29,6 +31,55 @@ import { getString } from '@/lib/user-data';
 const IMAGE_CONTENT_TYPE = 'image/jpeg';
 const VIDEO_CONTENT_TYPE = 'video/mp4';
 const UPLOAD_ATTEMPTS = 3;
+
+const CLIP_LENGTHS = ['15s', '60s', '3m'] as const;
+
+// Recording stops at whichever of these the user picked, in seconds. expo-camera takes the
+// limit in seconds and stops on its own when it is reached.
+const CLIP_SECONDS: Record<(typeof CLIP_LENGTHS)[number], number> = {
+  '15s': 15,
+  '3m': 180,
+  '60s': 60,
+};
+
+// expo-camera takes zoom as a 0 to 1 fraction of the device's maximum, and it clamps
+// anything outside that itself. The bar steps through it in tenths.
+const MIN_ZOOM = 0;
+const MAX_ZOOM = 1;
+const ZOOM_STEP = 0.1;
+
+// The flash cycles through these in order when its tool is tapped.
+const FLASH_CYCLE = ['off', 'on', 'auto'] as const;
+
+// The self timer cycles through these, in seconds, where 0 means no delay at all.
+const TIMER_CYCLE = [0, 3, 10] as const;
+
+function timerLabel(seconds: number) {
+  return seconds === 0 ? 'Off' : `${seconds}s`;
+}
+
+const FLASH_ICONS: Record<(typeof FLASH_CYCLE)[number], keyof typeof Ionicons.glyphMap> = {
+  // Ionicons has no flash-auto glyph, checked against the shipped glyphmap, so auto borrows
+  // sunny as the closest distinct one. The label below carries the exact mode either way.
+  auto: 'sunny-outline',
+  off: 'flash-off-outline',
+  on: 'flash-outline',
+};
+
+const FLASH_LABELS: Record<(typeof FLASH_CYCLE)[number], string> = {
+  auto: 'Auto',
+  off: 'Off',
+  on: 'On',
+};
+
+const TOOLS: { label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
+  { label: 'Flash', icon: 'flash-off-outline' },
+  { label: 'Timer', icon: 'timer-outline' },
+  { label: 'Layout', icon: 'grid-outline' },
+  { label: 'Crop', icon: 'crop-outline' },
+  { label: 'Filter', icon: 'color-filter-outline' },
+  { label: 'AI', icon: 'color-wand-outline' },
+];
 
 const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '';
@@ -174,6 +225,36 @@ export default function UploadScreen() {
   const [isPicking, setIsPicking] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
+  // Camera state. The mode pills drive the camera itself: PHOTO takes a picture, the
+  // durations record a video capped at the chosen length.
+  const [mediaMode, setMediaMode] = useState<'video' | 'photo'>('video');
+  const [clipLength, setClipLength] = useState<'15s' | '60s' | '3m'>('15s');
+  // The caption is a second step: POST opens this, and DONE in the caption bar is what runs
+  // the upload. Keeps the camera view clear of a keyboard-eating text field.
+  const [showCaptionInput, setShowCaptionInput] = useState(false);
+
+  const [facing, setFacing] = useState<CameraType>('back');
+  const [zoom, setZoom] = useState(MIN_ZOOM);
+  const [flash, setFlash] = useState<FlashMode>(FLASH_CYCLE[0]);
+  const [timer, setTimer] = useState<number>(TIMER_CYCLE[0]);
+  const [showGrid, setShowGrid] = useState(false);
+  // Seconds left on the countdown, or null when nothing is counting. It reaches 0 for one
+  // tick before the capture runs, so the number never shows a 0.
+  const [countdown, setCountdown] = useState<number | null>(null);
+  // Mirrors the zoom level, so a burst of taps always steps from the level that is on screen
+  // rather than from a value captured in an older render.
+  const zoomRef = useRef(zoom);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [isCameraReady, setIsCameraReady] = useState(false);
+  const cameraRef = useRef<CameraView>(null);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [microphonePermission, requestMicrophonePermission] = useMicrophonePermissions();
+  // Plays back a captured or picked clip. The source follows the selected media, so the
+  // player is empty while a photo is showing rather than holding the last clip.
+  const previewPlayer = useVideoPlayer(media?.mediaType === 'video' ? media.uri : null, (player) => {
+    player.loop = true;
+  });
 
   useEffect(() => {
     let unsubscribe = () => {};
@@ -232,7 +313,7 @@ export default function UploadScreen() {
       const result = await ImagePicker.launchImageLibraryAsync({
         allowsEditing: false,
         base64: true,
-        mediaTypes: ['images', 'videos'],
+        mediaTypes: mediaMode === 'photo' ? ['images'] : ['images', 'videos'],
         quality: 1,
       });
 
@@ -261,7 +342,224 @@ export default function UploadScreen() {
     } finally {
       setIsPicking(false);
     }
+  }, [mediaMode]);
+
+  // Asks for the camera, and the microphone too when a clip is about to be recorded with
+  // sound. Resolves false when a permission was refused, so the caller can say so instead of
+  // starting a capture that is guaranteed to fail.
+  const ensureCameraPermissions = useCallback(
+    async (needsMicrophone: boolean) => {
+      if (!cameraPermission?.granted) {
+        const result = await requestCameraPermission();
+        if (!result.granted) {
+          Alert.alert(
+            'Camera permission needed',
+            'Allow camera access in your device settings to shoot a post.'
+          );
+          return false;
+        }
+      }
+
+      if (needsMicrophone && !microphonePermission?.granted) {
+        const result = await requestMicrophonePermission();
+        if (!result.granted) {
+          Alert.alert(
+            'Microphone permission needed',
+            'Allow microphone access in your device settings to record a clip with sound.'
+          );
+          return false;
+        }
+      }
+
+      return true;
+    },
+    [cameraPermission, microphonePermission, requestCameraPermission, requestMicrophonePermission]
+  );
+
+  // Photo mode: one shot, straight into the same media state the gallery fills, so the
+  // preview and the upload path are shared with a picked file.
+  const capturePhoto = useCallback(async () => {
+    if (isCapturing || !cameraRef.current) {
+      return;
+    }
+
+    setErrorMessage('');
+
+    if (!(await ensureCameraPermissions(false))) {
+      return;
+    }
+
+    setIsCapturing(true);
+
+    try {
+      const picture = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.9 });
+
+      if (!picture) {
+        return;
+      }
+
+      if (!picture.base64) {
+        setErrorMessage('Could not read the photo. Please try again.');
+        return;
+      }
+
+      setMedia({
+        base64: picture.base64,
+        contentType: IMAGE_CONTENT_TYPE,
+        mediaType: 'image',
+        uri: picture.uri,
+      });
+    } catch (error) {
+      console.error('Could not take a photo:', error);
+      setErrorMessage('Could not take a photo. Please try again.');
+    } finally {
+      setIsCapturing(false);
+    }
+  }, [ensureCameraPermissions, isCapturing]);
+
+  // Video mode: the button starts the recording and the same button stops it, the way a
+  // camera app behaves. recordAsync only settles once the recording ends, so it is started
+  // without await and the stop is what completes it.
+  const toggleRecording = useCallback(async () => {
+    if (!cameraRef.current || isCapturing) {
+      return;
+    }
+
+    setErrorMessage('');
+
+    if (isRecording) {
+      cameraRef.current.stopRecording();
+      return;
+    }
+
+    if (!(await ensureCameraPermissions(true))) {
+      return;
+    }
+
+    setIsRecording(true);
+
+    try {
+      const recording = cameraRef.current.recordAsync({ maxDuration: CLIP_SECONDS[clipLength] });
+      const result = await recording;
+
+      // Undefined means the camera was stopped without producing a file, for example by
+      // flipping the camera mid recording. Nothing to keep in that case.
+      if (!result?.uri) {
+        return;
+      }
+
+      setMedia({
+        // Videos are uploaded from the uri, so no base64 is needed here.
+        base64: '',
+        contentType: VIDEO_CONTENT_TYPE,
+        mediaType: 'video',
+        uri: result.uri,
+      });
+    } catch (error) {
+      console.error('Could not record a video:', error);
+      setErrorMessage('Could not record a video. Please try again.');
+    } finally {
+      setIsRecording(false);
+    }
+  }, [clipLength, ensureCameraPermissions, isCapturing, isRecording]);
+
+  // What the shutter actually does once any countdown is out of the way.
+  const startCapture = useCallback(() => {
+    if (mediaMode === 'photo') {
+      void capturePhoto();
+      return;
+    }
+
+    void toggleRecording();
+  }, [capturePhoto, mediaMode, toggleRecording]);
+
+  const onShutterPress = useCallback(() => {
+    // With something already captured the shutter starts over, which is how a camera app
+    // behaves: the first press drops back to the viewfinder, the next one shoots.
+    if (media) {
+      setMedia(null);
+      return;
+    }
+
+    // A second press mid countdown would start a second one, so it does nothing.
+    if (countdown !== null) {
+      return;
+    }
+
+    if (timer > 0) {
+      setCountdown(timer);
+      return;
+    }
+
+    startCapture();
+  }, [countdown, media, startCapture, timer]);
+
+  // Off, on, auto, then back to off.
+  const cycleFlash = useCallback(() => {
+    setFlash((current) => {
+      const next = FLASH_CYCLE.indexOf(current as (typeof FLASH_CYCLE)[number]) + 1;
+      return FLASH_CYCLE[next % FLASH_CYCLE.length];
+    });
   }, []);
+
+  // No delay, 3 seconds, 10 seconds, then back to no delay.
+  const cycleTimer = useCallback(() => {
+    setTimer((current) => {
+      const next = TIMER_CYCLE.indexOf(current as (typeof TIMER_CYCLE)[number]) + 1;
+      return TIMER_CYCLE[next % TIMER_CYCLE.length];
+    });
+  }, []);
+
+  // Drives the countdown one second at a time, then runs the capture. Both state updates sit
+  // inside the timeout rather than in the effect body, and the timeout is cleared on every
+  // change and on unmount, so leaving the screen or changing the timer mid countdown never
+  // fires a capture in the background.
+  useEffect(() => {
+    if (countdown === null) {
+      return undefined;
+    }
+
+    const timeout = setTimeout(() => {
+      if (countdown <= 1) {
+        setCountdown(null);
+        startCapture();
+        return;
+      }
+
+      setCountdown(countdown - 1);
+    }, 1000);
+
+    return () => clearTimeout(timeout);
+  }, [countdown, startCapture]);
+
+  // One entry point for every zoom change, so the ref the buttons read can never drift from
+  // the state the camera is given.
+  const applyZoom = useCallback((value: number) => {
+    const next = Math.min(Math.max(value, MIN_ZOOM), MAX_ZOOM);
+    zoomRef.current = next;
+    setZoom(next);
+  }, []);
+
+  // Flipping while recording would stop the recording halfway, so it is ignored until the
+  // clip is saved. Zoom goes back to 1x with the flip, because the front and back cameras
+  // reach different magnifications and a level carried over would look wrong on one of them.
+  const flipCamera = useCallback(() => {
+    if (isRecording) {
+      return;
+    }
+
+    setFacing((current) => (current === 'back' ? 'front' : 'back'));
+    applyZoom(MIN_ZOOM);
+  }, [applyZoom, isRecording]);
+
+  // Rounded to a tenth on the way in, so repeated taps cannot drift into 0.30000000000000004
+  // and leave the bar sitting a hair off the level it claims.
+  const stepZoom = useCallback(
+    (delta: number) => {
+      applyZoom(Math.round((zoomRef.current + delta) / ZOOM_STEP) * ZOOM_STEP);
+    },
+    [applyZoom]
+  );
 
   const uploadPost = useCallback(async () => {
     if (!currentUser) {
@@ -356,11 +654,16 @@ export default function UploadScreen() {
     setCaption('');
     setMedia(null);
     setSound(null);
+    setShowCaptionInput(false);
     Alert.alert('Success', 'Post uploaded successfully.');
     router.replace('/home');
   }, [caption, currentUser, displayName, media, sound]);
 
   const isBusy = isUploading || isPicking;
+
+  const comingSoon = useCallback((label: string) => {
+    Alert.alert(label, 'This control is part of the new camera UI. Capture and editing are not wired up yet.');
+  }, []);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -368,120 +671,378 @@ export default function UploadScreen() {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         style={styles.container}
       >
-        <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-          <Text style={styles.eyebrow}>SHARE</Text>
-          <Text style={styles.header}>Create Post</Text>
+        <View style={styles.topBar}>
+        <Pressable
+          accessibilityLabel="Close"
+          accessibilityRole="button"
+          hitSlop={10}
+          onPress={() => router.back()}
+          style={styles.circleButton}
+        >
+          <Ionicons color="#FFFFFF" name="close" size={26} />
+        </Pressable>
 
-          {!isSupabaseConfigured() ? (
-            <View style={styles.notice}>
-              <Text style={styles.noticeTitle}>Supabase setup needed</Text>
-              <Text style={styles.noticeBody}>
-                {`Add these to .env.local and restart the dev server:\nEXPO_PUBLIC_SUPABASE_URL\nEXPO_PUBLIC_SUPABASE_ANON_KEY`}
-              </Text>
+        <Pressable
+          accessibilityLabel={sound ? 'Change sound' : 'Add sound'}
+          accessibilityRole="button"
+          disabled={isBusy}
+          onPress={() => setIsPickingSound(true)}
+          style={styles.addSoundButton}
+        >
+          <Ionicons color="#FFFFFF" name="musical-note" size={18} />
+          <Text numberOfLines={1} style={styles.addSoundText}>
+            {sound ? sound.title : 'Add sound'}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          accessibilityLabel="Flip camera"
+          accessibilityRole="button"
+          onPress={flipCamera}
+          style={styles.circleButton}
+        >
+          <Ionicons color="#FFFFFF" name="camera-reverse-outline" size={24} />
+        </Pressable>
+      </View>
+
+      <View pointerEvents="box-none" style={styles.stage}>
+        {/* box-none on both this and the stage: the containers themselves never take a touch,
+            only what is inside them does, so an overlay can never swallow the pinch meant
+            for the viewfinder underneath. */}
+        <View pointerEvents="box-none" style={styles.preview}>
+          {media ? (
+            <>
+              {media.mediaType === 'image' ? (
+                <Image contentFit="cover" source={{ uri: media.uri }} style={styles.previewMedia} />
+              ) : (
+                <VideoView contentFit="cover" nativeControls={false} player={previewPlayer} style={styles.previewMedia} />
+              )}
+              <Pressable onPress={() => setMedia(null)} style={styles.changeTag}>
+                <Text style={styles.changeTagText}>Retake</Text>
+              </Pressable>
+            </>
+          ) : cameraPermission?.granted ? (
+            <CameraView
+              facing={facing}
+              flash={flash}
+              mode={mediaMode === 'photo' ? 'picture' : 'video'}
+              onCameraReady={() => setIsCameraReady(true)}
+              onMountError={(event) => {
+                setIsCameraReady(false);
+                setErrorMessage(`Camera unavailable: ${event.message}`);
+              }}
+              ref={cameraRef}
+              style={styles.previewMedia}
+              zoom={zoom}
+            />
+          ) : (
+            <View style={styles.previewEmpty}>
+              {cameraPermission === null ? (
+                <ActivityIndicator color="#FFFFFF" />
+              ) : (
+                <>
+                  <Ionicons color="rgba(255, 255, 255, 0.45)" name="videocam-outline" size={44} />
+                  <Text style={styles.previewEmptyText}>Camera access is off</Text>
+                  <Pressable
+                    accessibilityLabel="Allow camera access"
+                    accessibilityRole="button"
+                    onPress={() => void requestCameraPermission()}
+                    style={styles.permissionButton}
+                  >
+                    <Text style={styles.permissionButtonText}>Allow camera</Text>
+                  </Pressable>
+                </>
+              )}
+            </View>
+          )}
+
+          {showGrid ? (
+            <View pointerEvents="none" style={styles.gridOverlay}>
+              <View style={styles.gridLineVertical} />
+              <View style={styles.gridColumnRight} />
+              <View style={styles.gridLineHorizontal} />
+              <View style={styles.gridRowBottom} />
             </View>
           ) : null}
 
-          <Pressable
-            accessibilityLabel="Pick a photo or video"
-            accessibilityRole="button"
-            disabled={isBusy}
-            onPress={() => void pickMedia()}
-            style={({ pressed }) => [styles.mediaPicker, pressed && styles.pressed, isBusy && styles.disabled]}
-          >
-            {media ? (
-              <>
-                {media.mediaType === 'image' ? (
-                  <Image contentFit="cover" source={{ uri: media.uri }} style={styles.mediaPreview} />
-                ) : (
-                  <View style={styles.mediaPreview}>
-                    <Text style={styles.videoBadge}>VIDEO</Text>
-                    <Text style={styles.videoHint}>{VIDEO_CONTENT_TYPE}</Text>
+          {countdown !== null && countdown > 0 ? (
+            <View pointerEvents="none" style={styles.countdownOverlay}>
+              <Text style={styles.countdownText}>{countdown}</Text>
+            </View>
+          ) : null}
+
+          {zoom > 0 ? (
+            <View pointerEvents="none" style={styles.zoomBadge}>
+              <Text style={styles.zoomBadgeText}>{`${(1 + zoom).toFixed(1)}x`}</Text>
+            </View>
+          ) : null}
+
+          {isRecording ? (
+            <View pointerEvents="none" style={styles.recordingBadge}>
+              <View style={styles.recordingDot} />
+              <Text style={styles.recordingText}>{`Recording, up to ${clipLength}`}</Text>
+            </View>
+          ) : null}
+
+          {!isSupabaseConfigured() ? (
+            <View pointerEvents="none" style={styles.supabaseNotice}>
+              <Text style={styles.supabaseNoticeText}>
+                Add EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY to .env.local, then restart the dev
+                server.
+              </Text>
+            </View>
+          ) : null}
+        </View>
+
+        <ScrollView
+          contentContainerStyle={styles.toolRailContent}
+          showsVerticalScrollIndicator={false}
+          style={styles.toolRail}
+        >
+          {TOOLS.map((tool) => {
+            // Flash drives the camera, so it shows the live mode and its own label. Everything
+            // else is still a placeholder.
+            if (tool.label === 'Flash') {
+              const mode = flash as (typeof FLASH_CYCLE)[number];
+
+              return (
+                <Pressable
+                  key={tool.label}
+                  accessibilityLabel={`Flash, currently ${FLASH_LABELS[mode]}`}
+                  accessibilityRole="button"
+                  onPress={cycleFlash}
+                  style={styles.toolItem}
+                >
+                  <View style={styles.toolButton}>
+                    <Ionicons color="#FFFFFF" name={FLASH_ICONS[mode]} size={20} />
                   </View>
-                )}
-                <View style={styles.replaceTag}>
-                  <Text style={styles.replaceTagText}>Change</Text>
+                  <Text style={styles.toolLabel}>{FLASH_LABELS[mode]}</Text>
+                </Pressable>
+              );
+            }
+
+            if (tool.label === 'Timer') {
+              return (
+                <Pressable
+                  key={tool.label}
+                  accessibilityLabel={`Self timer, currently ${timerLabel(timer)}`}
+                  accessibilityRole="button"
+                  onPress={cycleTimer}
+                  style={styles.toolItem}
+                >
+                  <View style={styles.toolButton}>
+                    <Ionicons
+                      color={timer > 0 ? '#FE2C55' : '#FFFFFF'}
+                      name={tool.icon}
+                      size={20}
+                    />
+                  </View>
+                  <Text style={styles.toolLabel}>{timerLabel(timer)}</Text>
+                </Pressable>
+              );
+            }
+
+            if (tool.label === 'Layout') {
+              return (
+                <Pressable
+                  key={tool.label}
+                  accessibilityLabel={`Composition grid, ${showGrid ? 'on' : 'off'}`}
+                  accessibilityRole="button"
+                  onPress={() => setShowGrid((current) => !current)}
+                  style={styles.toolItem}
+                >
+                  <View style={styles.toolButton}>
+                    <Ionicons color={showGrid ? '#FE2C55' : '#FFFFFF'} name={tool.icon} size={20} />
+                  </View>
+                  <Text style={styles.toolLabel}>{tool.label}</Text>
+                </Pressable>
+              );
+            }
+
+            return (
+              <Pressable
+                key={tool.label}
+                accessibilityLabel={tool.label}
+                accessibilityRole="button"
+                onPress={() => comingSoon(tool.label === 'AI' ? 'AI Features' : tool.label)}
+                style={styles.toolItem}
+              >
+                <View style={styles.toolButton}>
+                  <Ionicons color="#FFFFFF" name={tool.icon} size={20} />
                 </View>
-              </>
-            ) : (
-              <View style={styles.pickerPlaceholder}>
-                <Text style={styles.pickerPlus}>+</Text>
-                <Text style={styles.mediaPickerText}>Select Photo or Video</Text>
-              </View>
-            )}
+                <Text style={styles.toolLabel}>{tool.label}</Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      </View>
+
+      {errorMessage ? (
+        <Text numberOfLines={2} style={styles.errorText}>
+          {errorMessage}
+        </Text>
+      ) : null}
+
+      {/* Bottom cluster, in normal flow from here down: mode row, shutter row, caption bar,
+          then the POST and CREATE row. Absolute offsets kept colliding with the shutter row
+          because every number had to be measured against the screen bottom. */}
+      <View style={styles.modeRow}>
+        {CLIP_LENGTHS.map((length) => (
+          <Pressable
+            key={length}
+            accessibilityRole="button"
+            onPress={() => setClipLength(length)}
+            style={[styles.modePill, clipLength === length && styles.modePillActive]}
+          >
+            <Text style={[styles.modePillText, clipLength === length && styles.modePillTextActive]}>
+              {length}
+            </Text>
+          </Pressable>
+        ))}
+
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => {
+            setMediaMode(mediaMode === 'photo' ? 'video' : 'photo');
+            setMedia(null);
+          }}
+          style={[styles.modePill, mediaMode === 'photo' && styles.modePillActive]}
+        >
+          <Text style={[styles.modePillText, mediaMode === 'photo' && styles.modePillTextActive]}>PHOTO</Text>
+        </Pressable>
+
+        <Pressable accessibilityRole="button" onPress={() => comingSoon('Text')} style={styles.modePill}>
+          <Text style={styles.modePillText}>TEXT</Text>
+        </Pressable>
+      </View>
+
+      {/* Zoom bar, directly above the shutter row. Only rendered while the viewfinder is up:
+          with a photo or clip already captured there is no camera for it to move. */}
+      {!media && cameraPermission?.granted ? (
+        <View style={styles.zoomRow}>
+          <Pressable
+            accessibilityLabel="Zoom out"
+            accessibilityRole="button"
+            disabled={zoom <= MIN_ZOOM}
+            hitSlop={8}
+            onPress={() => stepZoom(-ZOOM_STEP)}
+            style={styles.zoomButton}
+          >
+            <Ionicons
+              color={zoom <= MIN_ZOOM ? 'rgba(255, 255, 255, 0.3)' : '#FFFFFF'}
+              name="remove-circle-outline"
+              size={28}
+            />
           </Pressable>
 
-          {/* Centred between the media and the caption: the sound belongs to the post itself,
-              so it sits in the middle of the form rather than at either end of it. */}
-          <View style={styles.soundRow}>
-            <Pressable
-              accessibilityLabel={sound ? 'Change sound' : 'Add a sound'}
-              accessibilityRole="button"
-              disabled={isBusy}
-              onPress={() => setIsPickingSound(true)}
-              style={({ pressed }) => [styles.soundButton, pressed && styles.pressed, isBusy && styles.disabled]}
-            >
-              {sound ? (
-                <>
-                  {sound.imageUrl ? (
-                    <Image contentFit="cover" source={{ uri: sound.imageUrl }} style={styles.soundCover} />
-                  ) : (
-                    <View style={[styles.soundCover, styles.soundCoverFallback]}>
-                      <Ionicons color="#FFFFFF" name="musical-notes" size={18} />
-                    </View>
-                  )}
-
-                  <View style={styles.soundText}>
-                    <Text numberOfLines={1} style={styles.soundTitle}>{sound.title}</Text>
-                    <Text numberOfLines={1} style={styles.soundArtist}>{sound.artist}</Text>
-                  </View>
-                </>
-              ) : (
-                <>
-                  <View style={styles.soundIcon}>
-                    <Ionicons color="#FFFFFF" name="musical-notes" size={18} />
-                  </View>
-                  <Text style={styles.soundPlaceholder}>Select a sound</Text>
-                </>
-              )}
-            </Pressable>
-
-            {sound ? (
-              <Pressable
-                accessibilityLabel="Remove sound"
-                accessibilityRole="button"
-                disabled={isBusy}
-                onPress={() => setSound(null)}
-                style={({ pressed }) => [styles.soundRemove, pressed && styles.pressed, isBusy && styles.disabled]}
-              >
-                <Ionicons color="#656A73" name="close" size={18} />
-              </Pressable>
-            ) : null}
+          <View style={styles.zoomTrack}>
+            <View style={[styles.zoomFill, { width: `${zoom * 100}%` }]} />
           </View>
 
-          <Text style={styles.inputLabel}>Caption</Text>
+          <Pressable
+            accessibilityLabel="Zoom in"
+            accessibilityRole="button"
+            disabled={zoom >= MAX_ZOOM}
+            hitSlop={8}
+            onPress={() => stepZoom(ZOOM_STEP)}
+            style={styles.zoomButton}
+          >
+            <Ionicons
+              color={zoom >= MAX_ZOOM ? 'rgba(255, 255, 255, 0.3)' : '#FFFFFF'}
+              name="add-circle-outline"
+              size={28}
+            />
+          </Pressable>
+        </View>
+      ) : null}
+
+      <View style={styles.shutterRow}>
+        <Pressable
+          accessibilityLabel="Open gallery"
+          accessibilityRole="button"
+          disabled={isBusy}
+          onPress={() => void pickMedia()}
+          style={[styles.galleryButton, isBusy && styles.disabled]}
+        >
+          {media ? (
+            <Image contentFit="cover" source={{ uri: media.uri }} style={styles.galleryImage} />
+          ) : (
+            <Ionicons color="#FFFFFF" name="images-outline" size={22} />
+          )}
+        </Pressable>
+
+        <Pressable
+          accessibilityLabel={isRecording ? 'Stop recording' : countdown !== null ? 'Cancel countdown' : media ? 'Retake' : 'Record'}
+          accessibilityRole="button"
+          disabled={!media && (!isCameraReady || countdown !== null)}
+          onPress={onShutterPress}
+          style={({ pressed }) => [styles.shutterOuter, pressed && styles.pressed]}
+        >
+          <View style={[styles.shutterInner, isRecording && styles.shutterInnerRecording]} />
+        </Pressable>
+
+        <Pressable
+          accessibilityLabel="Effects"
+          accessibilityRole="button"
+          onPress={() => comingSoon('Effects')}
+          style={styles.galleryButton}
+        >
+          <Ionicons color="#FFFFFF" name="sparkles-outline" size={22} />
+        </Pressable>
+      </View>
+
+      {showCaptionInput ? (
+        <View style={styles.captionBar}>
           <TextInput
             editable={!isUploading}
             maxLength={220}
-            multiline
             onChangeText={setCaption}
             placeholder="Write a caption..."
-            placeholderTextColor="#8D929C"
-            style={styles.input}
+            placeholderTextColor="rgba(255, 255, 255, 0.5)"
+            style={styles.captionField}
             value={caption}
           />
-
-          {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
-
           <Pressable
-            accessibilityLabel="Share post"
+            accessibilityLabel="Upload post"
             accessibilityRole="button"
             disabled={isBusy}
             onPress={() => void uploadPost()}
-            style={({ pressed }) => [styles.postButton, pressed && styles.pressed, isBusy && styles.disabled]}
+            style={({ pressed }) => [styles.captionDone, pressed && styles.pressed, isBusy && styles.disabled]}
           >
-            {isBusy ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.postButtonText}>Post</Text>}
+            {isUploading ? (
+              <ActivityIndicator color="#FFFFFF" />
+            ) : (
+              <Text style={styles.captionDoneText}>DONE</Text>
+            )}
           </Pressable>
-        </ScrollView>
+        </View>
+      ) : null}
+
+      <View style={styles.bottomBar}>
+        <Pressable
+          accessibilityLabel="Add a caption and continue"
+          accessibilityRole="button"
+          onPress={() => setShowCaptionInput(true)}
+          style={({ pressed }) => [styles.postButton, pressed && styles.pressed]}
+        >
+          <Text style={styles.postButtonText}>POST</Text>
+        </Pressable>
+
+        <Pressable
+          accessibilityLabel="Start over"
+          accessibilityRole="button"
+          disabled={isBusy}
+          onPress={() => {
+            setMedia(null);
+            setCaption('');
+            setSound(null);
+            setShowCaptionInput(false);
+          }}
+          style={({ pressed }) => [styles.createButton, pressed && styles.pressed, isBusy && styles.disabled]}
+        >
+          <Text style={styles.createButtonText}>CREATE</Text>
+        </Pressable>
+      </View>
       </KeyboardAvoidingView>
 
       <MusicSearchSheet
@@ -499,199 +1060,436 @@ export default function UploadScreen() {
 
 const styles = StyleSheet.create({
   safeArea: {
-    backgroundColor: '#F7F4EF',
+    backgroundColor: '#000000',
     flex: 1,
   },
   container: {
     flex: 1,
   },
-  content: {
-    padding: 22,
-    paddingBottom: 40,
-  },
-  eyebrow: {
-    color: '#E56B4C',
-    fontSize: 11,
-    fontWeight: '800',
-    letterSpacing: 1.6,
-    marginBottom: 4,
-  },
-  header: {
-    color: '#20232A',
-    fontSize: 26,
-    fontWeight: '800',
-    marginBottom: 18,
-  },
-  notice: {
-    backgroundColor: '#FFF4E9',
-    borderColor: '#E7C79A',
-    borderRadius: 14,
-    borderWidth: 1,
-    marginBottom: 16,
-    padding: 14,
-  },
-  noticeTitle: {
-    color: '#8A5A22',
-    fontSize: 14,
-    fontWeight: '800',
-    marginBottom: 6,
-  },
-  noticeBody: {
-    color: '#8A5A22',
-    fontSize: 12,
-    lineHeight: 18,
-  },
-  mediaPicker: {
+  topBar: {
     alignItems: 'center',
-    backgroundColor: '#20232A',
-    borderRadius: 20,
-    height: 260,
-    justifyContent: 'center',
-    overflow: 'hidden',
-    width: '100%',
-  },
-  mediaPreview: {
-    alignItems: 'center',
-    height: '100%',
-    justifyContent: 'center',
-    width: '100%',
-  },
-  pickerPlaceholder: {
-    alignItems: 'center',
-    gap: 10,
-  },
-  pickerPlus: {
-    color: '#FFFFFF',
-    fontSize: 40,
-    fontWeight: '300',
-  },
-  mediaPickerText: {
-    color: '#FFFFFF',
-    fontSize: 15,
-    fontWeight: '600',
-  },
-  videoBadge: {
-    backgroundColor: '#E56B4C',
-    borderRadius: 6,
-    color: '#FFFFFF',
-    fontSize: 11,
-    fontWeight: '900',
-    letterSpacing: 1.2,
-    overflow: 'hidden',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-  },
-  videoHint: {
-    color: '#A9AEB8',
-    fontSize: 13,
-    marginTop: 10,
-  },
-  replaceTag: {
-    backgroundColor: 'rgba(32, 35, 42, 0.72)',
-    borderRadius: 14,
-    bottom: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    position: 'absolute',
-    right: 12,
-  },
-  replaceTagText: {
-    color: '#FFFFFF',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  inputLabel: {
-    color: '#656A73',
-    fontSize: 12,
-    fontWeight: '800',
-    letterSpacing: 1,
-    marginBottom: 8,
-    marginTop: 20,
-    textTransform: 'uppercase',
-  },
-  // The sound control is centred on its own row, between the media and the caption.
-  soundRow: {
-    alignItems: 'center',
-    alignSelf: 'center',
     flexDirection: 'row',
-    gap: 8,
-    marginTop: 18,
+    // X hard left, Add sound centred, flip camera hard right.
+    justifyContent: 'space-between',
+    paddingHorizontal: 15,
   },
-  soundButton: {
+  circleButton: {
     alignItems: 'center',
-    backgroundColor: '#20232A',
+    height: 40,
+    justifyContent: 'center',
+    width: 40,
+  },
+  addSoundButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
     borderRadius: 999,
     flexDirection: 'row',
-    gap: 10,
-    maxWidth: '86%',
-    paddingHorizontal: 8,
+    gap: 6,
+    maxWidth: '52%',
+    paddingHorizontal: 14,
     paddingVertical: 8,
   },
-  soundIcon: {
-    alignItems: 'center',
-    backgroundColor: '#E56B4C',
-    borderRadius: 16,
-    height: 32,
-    justifyContent: 'center',
-    width: 32,
-  },
-  soundPlaceholder: {
+  addSoundText: {
     color: '#FFFFFF',
+    flexShrink: 1,
     fontSize: 14,
     fontWeight: '700',
-    paddingHorizontal: 10,
-    paddingRight: 6,
   },
-  soundCover: {
-    borderRadius: 16,
-    height: 32,
-    width: 32,
+  stage: {
+    flex: 1,
+    marginTop: 10,
   },
-  soundCoverFallback: {
+  preview: {
+    backgroundColor: '#0C0C0F',
+    bottom: 0,
+    left: 0,
+    overflow: 'hidden',
+    position: 'absolute',
+    // Stops short of the tool rail, which now occupies 12 to 52 from the right edge.
+    right: 56,
+    top: 0,
+  },
+  previewMedia: {
+    height: '100%',
+    width: '100%',
+  },
+  changeTag: {
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    position: 'absolute',
+    right: 12,
+    top: 12,
+  },
+  changeTagText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  previewEmpty: {
     alignItems: 'center',
-    backgroundColor: '#3A3F4A',
+    flex: 1,
+    gap: 12,
     justifyContent: 'center',
   },
-  soundText: { flexShrink: 1, paddingRight: 6 },
-  soundTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
-  soundArtist: { color: '#A9AEB8', fontSize: 11, marginTop: 1 },
-  soundRemove: {
-    alignItems: 'center',
-    backgroundColor: '#EDE8E0',
-    borderRadius: 16,
-    height: 32,
-    justifyContent: 'center',
-    width: 32,
+  previewEmptyText: {
+    color: 'rgba(255, 255, 255, 0.45)',
+    fontSize: 13,
+    fontWeight: '600',
+    letterSpacing: 0.6,
   },
-  input: {
-    backgroundColor: '#FFFFFF',
-    borderColor: '#E7E2DA',
-    borderRadius: 14,
+  supabaseNotice: {
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    borderRadius: 10,
+    left: 12,
+    padding: 10,
+    position: 'absolute',
+    right: 12,
+    top: 12,
+  },
+  supabaseNoticeText: {
+    color: '#F2D9B4',
+    fontSize: 11,
+    lineHeight: 16,
+  },
+  // Sits under the selected media, above the POST and CREATE row, and only exists once the
+  // user has asked for the caption step.
+  captionBar: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 10,
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+  },
+  captionField: {
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
+    borderColor: 'rgba(255, 255, 255, 0.28)',
+    borderRadius: 999,
     borderWidth: 1,
-    color: '#20232A',
-    fontSize: 15,
-    minHeight: 92,
-    padding: 14,
-    textAlignVertical: 'top',
+    color: '#FFFFFF',
+    flex: 1,
+    fontSize: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+  },
+  captionDone: {
+    alignItems: 'center',
+    backgroundColor: '#FE2C55',
+    borderRadius: 999,
+    justifyContent: 'center',
+    minHeight: 44,
+    paddingHorizontal: 20,
+  },
+  captionDoneText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '900',
+    letterSpacing: 1,
+  },
+  toolRail: {
+    // Pinned inside the stage, which ends above the mode row and the shutter row, so the
+    // stack can no longer grow out of it and land on TEXT or on the effects button. The 12
+    // below keeps the last tool off the stage edge and off the row underneath.
+    bottom: 12,
+    position: 'absolute',
+    right: 12,
+    top: 0,
+  },
+  toolRailContent: {
+    alignItems: 'center',
+    // Centres the tools in the space available, and scrolls instead of overflowing when a
+    // short screen cannot fit all six. Six tools are about 400 tall, which does not fit the
+    // stage on a small phone.
+    flexGrow: 1,
+    gap: 15,
+    justifyContent: 'center',
+  },
+  toolItem: {
+    alignItems: 'center',
+    gap: 3,
+  },
+  toolButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.42)',
+    borderRadius: 20,
+    height: 40,
+    justifyContent: 'center',
+    width: 40,
+  },
+  toolLabel: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    fontWeight: '600',
+  },
+  modeRow: {
+    alignItems: 'center',
+    // In normal flow, directly above the shutter row. The 12 below is the clear gap: the two
+    // rows can never overlap now, whatever height the shutter or the caption bar takes.
+    flexDirection: 'row',
+    // Spreads the five pills across the width instead of measuring a fixed gap that clipped
+    // on a 360dp screen. The pills keep their own size, so the space goes between them.
+    justifyContent: 'space-between',
+    paddingBottom: 12,
+    paddingHorizontal: 15,
+    paddingTop: 10,
+    width: '100%',
+  },
+  modePill: {
+    borderColor: 'rgba(255, 255, 255, 0.4)',
+    borderRadius: 999,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  modePillActive: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#FFFFFF',
+  },
+  modePillText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  modePillTextActive: {
+    color: '#000000',
+  },
+  zoomRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'center',
+    paddingBottom: 10,
+    width: '100%',
+  },
+  zoomButton: {
+    alignItems: 'center',
+    height: 32,
+    justifyContent: 'center',
+    width: 32,
+  },
+  zoomTrack: {
+    backgroundColor: 'rgba(255, 255, 255, 0.22)',
+    borderRadius: 999,
+    flex: 1,
+    height: 5,
+    justifyContent: 'center',
+    maxWidth: 190,
+    overflow: 'hidden',
+  },
+  zoomFill: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 999,
+    height: '100%',
+  },
+  shutterRow: {
+    alignItems: 'center',
+    // space-around rather than space-between: the record button lands in the middle of the
+    // screen with the gallery and effects sitting the same distance out on either side, and
+    // no side padding is needed to keep them off the edges.
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    paddingBottom: 12,
+    paddingTop: 2,
+    width: '100%',
+  },
+  galleryButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.16)',
+    borderColor: 'rgba(255, 255, 255, 0.5)',
+    borderRadius: 10,
+    borderWidth: 1,
+    height: 46,
+    justifyContent: 'center',
+    overflow: 'hidden',
+    width: 46,
+  },
+  galleryImage: {
+    height: '100%',
+    width: '100%',
+  },
+  permissionButton: {
+    backgroundColor: '#FE2C55',
+    borderRadius: 999,
+    marginTop: 6,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+  },
+  permissionButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  // Two vertical and two horizontal one pixel lines, spaced by a third of the preview each,
+  // which is what makes the nine thirds. A line is a background colour rather than a border:
+  // it draws the same single pixel without needing a wrapper per line.
+  gridOverlay: {
+    bottom: 0,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  gridLineVertical: {
+    backgroundColor: 'rgba(255, 255, 255, 0.5)',
+    bottom: 0,
+    left: '33.333%',
+    position: 'absolute',
+    top: 0,
+    width: 1,
+  },
+  gridColumnRight: {
+    backgroundColor: 'rgba(255, 255, 255, 0.5)',
+    bottom: 0,
+    left: '66.666%',
+    position: 'absolute',
+    top: 0,
+    width: 1,
+  },
+  gridLineHorizontal: {
+    backgroundColor: 'rgba(255, 255, 255, 0.5)',
+    height: 1,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: '33.333%',
+  },
+  gridRowBottom: {
+    backgroundColor: 'rgba(255, 255, 255, 0.5)',
+    height: 1,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: '66.666%',
+  },
+  countdownOverlay: {
+    alignItems: 'center',
+    // alignSelf plus no left or right is what centres an absolutely positioned child in
+    // React Native; pinning both edges with a fixed width would not.
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.45)',
+    borderColor: 'rgba(255, 255, 255, 0.35)',
+    borderRadius: 60,
+    borderWidth: 2,
+    height: 120,
+    justifyContent: 'center',
+    position: 'absolute',
+    top: '35%',
+    width: 120,
+  },
+  countdownText: {
+    color: '#FFFFFF',
+    fontSize: 64,
+    fontWeight: '900',
+  },
+  zoomBadge: {
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderRadius: 999,
+    // Bottom left rather than the top corner the recording badge uses, so a clip that is
+    // being recorded at a zoom does not show the two on top of each other.
+    bottom: 12,
+    left: 12,
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    position: 'absolute',
+  },
+  zoomBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  recordingBadge: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderRadius: 999,
+    flexDirection: 'row',
+    gap: 7,
+    left: 12,
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    position: 'absolute',
+    top: 12,
+  },
+  recordingDot: {
+    backgroundColor: '#FE2C55',
+    borderRadius: 4,
+    height: 8,
+    width: 8,
+  },
+  recordingText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  shutterOuter: {
+    alignItems: 'center',
+    borderColor: '#FFFFFF',
+    borderRadius: 40,
+    borderWidth: 4,
+    height: 80,
+    justifyContent: 'center',
+    width: 80,
+  },
+  shutterInner: {
+    backgroundColor: '#FE2C55',
+    borderRadius: 31,
+    height: 62,
+    width: 62,
+  },
+  // Square while recording, the way a camera app shows that it is already capturing.
+  shutterInnerRecording: {
+    borderRadius: 12,
+    height: 36,
+    width: 36,
   },
   errorText: {
-    color: '#B84141',
-    fontSize: 13,
-    lineHeight: 19,
-    marginTop: 14,
+    color: '#FF6B6B',
+    fontSize: 12,
+    paddingHorizontal: 15,
+    paddingVertical: 6,
+  },
+  bottomBar: {
+    // Fixed width buttons rather than flex 1: the pair is a compact centred block instead of
+    // a bar that fills the screen, and both buttons are the same width because the same
+    // value is on each of them.
+    flexDirection: 'row',
+    gap: 15,
+    justifyContent: 'center',
+    paddingBottom: 18,
+    paddingTop: 4,
   },
   postButton: {
     alignItems: 'center',
-    backgroundColor: '#E56B4C',
-    borderRadius: 16,
+    backgroundColor: '#FE2C55',
+    borderRadius: 10,
     justifyContent: 'center',
-    marginTop: 20,
-    minHeight: 56,
+    minHeight: 48,
+    paddingVertical: 12,
+    // Percentage based so the pair keeps its proportions on a narrow phone instead of the
+    // fixed 160 clipping the label on the smallest widths.
+    width: '32%',
   },
   postButtonText: {
     color: '#FFFFFF',
     fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+  },
+  createButton: {
+    alignItems: 'center',
+    borderColor: 'rgba(255, 255, 255, 0.45)',
+    borderRadius: 10,
+    borderWidth: 1,
+    justifyContent: 'center',
+    minHeight: 48,
+    paddingVertical: 12,
+    width: '32%',
+  },
+  createButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
     fontWeight: '800',
+    letterSpacing: 1.2,
   },
   disabled: {
     opacity: 0.5,

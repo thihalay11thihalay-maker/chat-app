@@ -5,15 +5,21 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { ErrorBoundary } from '@/components/error-boundary';
 import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
 
 export default function RootLayout() {
   return (
-    <ErrorBoundary>
-      <RootNavigator />
-    </ErrorBoundary>
+    // React Navigation, which expo-router runs on, uses react-native-gesture-handler for its
+    // own transitions and drawers, and it expects the root of the app to be a gesture handler
+    // root. Cheap to keep, and removing it risks breaking navigation gestures.
+    <GestureHandlerRootView style={styles.root}>
+      <ErrorBoundary>
+        <RootNavigator />
+      </ErrorBoundary>
+    </GestureHandlerRootView>
   );
 }
 
@@ -142,6 +148,9 @@ function RootNavigator() {
 }
 
 const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
   loadingScreen: {
     alignItems: 'center',
     backgroundColor: '#F7F4EF',

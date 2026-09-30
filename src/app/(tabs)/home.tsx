@@ -9,7 +9,6 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
-  Dimensions,
   FlatList,
   LayoutChangeEvent,
   NativeScrollEvent,
@@ -20,6 +19,7 @@ import {
   Share,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -104,7 +104,6 @@ function toPost(id: string, data: Record<string, unknown>): Post {
 function PostVideo({
   uri,
   bottomInset,
-  height,
   isActive,
   isMuted,
 }: {
@@ -112,7 +111,6 @@ function PostVideo({
   // Distance from the bottom of the post that the floating bars already cover, so the scrub
   // readout clears them instead of landing underneath.
   bottomInset: number;
-  height: number;
   isActive: boolean;
   isMuted: boolean;
 }) {
@@ -299,7 +297,9 @@ function PostVideo({
       onLayout={(event) => {
         trackWidthRef.current = event.nativeEvent.layout.width;
       }}
-      style={{ height, width: '100%' }}
+      // Fills the post rather than taking a fixed height, so the video follows the measured
+      // page height and never overflows it.
+      style={styles.media}
       {...panResponder.panHandlers}
     >
       <Pressable
@@ -309,13 +309,15 @@ function PostVideo({
         onLongPress={() => setIsFastForwarding(true)}
         onPress={togglePlayback}
         onPressOut={() => setIsFastForwarding(false)}
-        style={{ height: '100%', width: '100%' }}
+        style={styles.mediaFill}
       >
+        {/* contain, not cover: a vertical clip or a wide one is shown whole instead of being
+            cropped and zoomed into by the viewport. */}
         <VideoView
-          contentFit="cover"
+          contentFit="contain"
           nativeControls={false}
           player={player}
-          style={{ height: '100%', width: '100%' }}
+          style={styles.mediaFill}
         />
 
         {isFastForwarding ? (
@@ -483,12 +485,14 @@ function PostSoundRow({
 export default function Home() {
   const isFocused = useIsFocused();
   const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   const [posts, setPosts] = useState<Post[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
   // The list is measured instead of trusting the window height, otherwise a header or
-  // safe area makes the page height and the item height disagree and snapping drifts.
-  const [pageHeight, setPageHeight] = useState(() => Dimensions.get('window').height);
+  // safe area makes the page height and the item height disagree and snapping drifts. The
+  // window is only the first guess, before the list has been laid out.
+  const [pageHeight, setPageHeight] = useState(() => windowHeight);
   const [activeIndex, setActiveIndex] = useState(0);
   const [isScrolling, setIsScrolling] = useState(false);
   const [selectedTab, setSelectedTab] = useState('Friends');
@@ -608,21 +612,25 @@ export default function Home() {
 
     return (
       <View style={[styles.itemContainer, { height: pageHeight }]}>
-        {item.mediaType === 'video' ? (
-          <PostVideo
-            bottomInset={bottomChrome}
-            height={pageHeight}
-            isActive={isCurrentPost}
-            isMuted={!isCurrentPost}
-            uri={item.mediaUrl ?? ''}
-          />
-        ) : (
-          <Image
-            contentFit="cover"
-            source={{ uri: item.mediaUrl || 'https://i.pravatar.cc/150?u=test' }}
-            style={{ height: '100%', width: '100%' }}
-          />
-        )}
+        {/* One wrapper owns the media box for both kinds, so a photo and a video are laid out
+            the same way and neither can spill past the page. No padding or margin: the post
+            has to reach the edges of the screen. */}
+        <View style={styles.media}>
+          {item.mediaType === 'video' ? (
+            <PostVideo
+              bottomInset={bottomChrome}
+              isActive={isCurrentPost}
+              isMuted={!isCurrentPost}
+              uri={item.mediaUrl ?? ''}
+            />
+          ) : (
+            <Image
+              contentFit="contain"
+              source={{ uri: item.mediaUrl || 'https://i.pravatar.cc/150?u=test' }}
+              style={styles.mediaFill}
+            />
+          )}
+        </View>
 
         {/* Only the caption: the author name lives in the social bar, and repeating it
             here stacked the same @name on top of the bar. */}
@@ -1373,6 +1381,11 @@ const styles = StyleSheet.create({
   emptyText: { color: 'white', fontSize: 20, fontWeight: 'bold' },
   emptySubText: { color: 'gray', fontSize: 14, marginTop: 10 },
   itemContainer: { width: '100%' },
+  // The media box: fills the item with no padding, and stays black so a photo that does not
+  // match the phone shape is letterboxed against it instead of showing an edge.
+  media: { backgroundColor: 'black', flex: 1, height: '100%', width: '100%' },
+  // What a photo, a video or the pressable around it all share.
+  mediaFill: { flex: 1, height: '100%', width: '100%' },
   // Sits directly on top of the social bar, so the caption is raised by the bar height plus
   // a little breathing room. The offset itself is applied at render, because the tab bar
   // height and the phone inset are only known on the device.

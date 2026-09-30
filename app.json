@@ -55,7 +55,16 @@
         }
       ],
       "expo-video",
-      "expo-asset"
+      "expo-asset",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Convo to use your camera to shoot posts.",
+          "microphonePermission": "Allow Convo to use your microphone to record video with sound.",
+          "recordAudioAndroid": true,
+          "barcodeScannerEnabled": false
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

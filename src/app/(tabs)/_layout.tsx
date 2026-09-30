@@ -52,6 +52,14 @@ const TABS: (TabItem & { name: string })[] = [
 // the last row of a list under the bar.
 const OVERLAY_TAB_KEYS = new Set(['home']);
 
+// The camera draws edge to edge on upload, so its bar is dropped instead of shortened. The
+// route level tabBarStyle option cannot do this: it only styles the default bar, and this
+// layout replaces that bar with the function below. Rendering nothing is what hides it, and
+// because the branch runs off the active route it comes straight back on the other tabs.
+const HIDDEN_TAB_KEYS = new Set(['upload']);
+
+const HIDDEN_TAB_BAR_STYLE = { display: 'none' } as const;
+
 export default function TabsLayout() {
   return (
     <Tabs
@@ -65,6 +73,10 @@ export default function TabsLayout() {
       tabBar={({ navigation, state }) => {
         const activeTab = TABS[state.index];
 
+        if (!activeTab || HIDDEN_TAB_KEYS.has(activeTab.key)) {
+          return null;
+        }
+
         return (
           <CurvedTabBar
             activeHref={activeTab?.href}
@@ -76,7 +88,17 @@ export default function TabsLayout() {
       }}
     >
       {TABS.map((tab) => (
-        <Tabs.Screen key={tab.key} name={tab.name} options={{ title: tab.label }} />
+        <Tabs.Screen
+          key={tab.key}
+          name={tab.name}
+          options={{
+            title: tab.label,
+            // Belt and braces. This only styles the built in bar, and the tabBar prop above
+            // replaces it, so HIDDEN_TAB_KEYS is what actually hides the bar on upload. Kept
+            // so the route still reads as tab-less if the custom bar is ever removed.
+            tabBarStyle: HIDDEN_TAB_KEYS.has(tab.key) ? HIDDEN_TAB_BAR_STYLE : undefined,
+          }}
+        />
       ))}
     </Tabs>
   );

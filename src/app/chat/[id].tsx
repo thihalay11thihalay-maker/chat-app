@@ -1,3 +1,4 @@
+import { Ionicons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { onAuthStateChanged, User } from 'firebase/auth';
@@ -123,9 +124,12 @@ export default function ChatDetailScreen() {
           <Pressable accessibilityRole="button" onPress={() => router.back()} style={styles.backButton}>
             <Text style={styles.backText}>{'<-'}</Text>
           </Pressable>
-          <View>
-            <Text style={styles.eyebrow}>CONVERSATION</Text>
-            <Text style={styles.title}>Chat {chatId}</Text>
+          {/* flex: 1 takes the space between the back button and the call buttons and hands
+              the rest back to them. Without it a long name on Android pushes the buttons off
+              screen, and numberOfLines has nothing to shrink into. */}
+          <View style={styles.headerTitle}>
+            <Text ellipsizeMode="tail" numberOfLines={1} style={styles.eyebrow}>CONVERSATION</Text>
+            <Text ellipsizeMode="tail" numberOfLines={1} style={styles.title}>{`Chat ${chatId}`}</Text>
           </View>
           <View style={styles.headerActions}>
             <Pressable
@@ -134,23 +138,18 @@ export default function ChatDetailScreen() {
               onPress={openCall}
               style={({ pressed }) => [styles.headerAction, pressed && styles.pressed]}
             >
-              <SymbolView
-                name={{ ios: 'phone.fill', android: 'call', web: 'call' }}
-                size={20}
-                tintColor="#20232A"
-              />
+              {/* Ionicons rather than SymbolView: expo-symbols renders through the Material
+                  Symbols font, which does not come up on Android here, so those two glyphs
+                  were drawing nothing and left the buttons blank. */}
+              <Ionicons color="#FFFFFF" name="call-outline" size={19} />
             </Pressable>
             <Pressable
               accessibilityLabel="Start video call"
               accessibilityRole="button"
               onPress={openCall}
-              style={({ pressed }) => [styles.headerAction, styles.videoAction, pressed && styles.pressed]}
+              style={({ pressed }) => [styles.headerAction, pressed && styles.pressed]}
             >
-              <SymbolView
-                name={{ ios: 'video.fill', android: 'videocam', web: 'videocam' }}
-                size={20}
-                tintColor="#FFFFFF"
-              />
+              <Ionicons color="#FFFFFF" name="videocam-outline" size={20} />
             </Pressable>
           </View>
         </View>
@@ -294,25 +293,30 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 14,
   },
+  // The only part of the header allowed to shrink, so a long name truncates with an ellipsis
+  // instead of shoving the call buttons off the edge. minWidth 0 lets it shrink below the
+  // width of the text itself, which Android needs before the ellipsis appears.
+  headerTitle: { flex: 1, minWidth: 0 },
   headerActions: {
     alignItems: 'center',
     flexDirection: 'row',
+    // Space between the two icons, and away from the edge of the screen on top of the
+    // container padding, so neither is clipped by a rounded corner or a gesture bar.
     gap: 9,
     marginLeft: 'auto',
+    marginRight: 15,
   },
+  // Dark so a white icon reads on it. The white circle the phone button used to have made a
+  // white glyph invisible on the same white fill.
   headerAction: {
     alignItems: 'center',
-    backgroundColor: '#FFFFFF',
-    borderColor: '#E7E2DA',
+    backgroundColor: '#20232A',
+    borderColor: '#20232A',
     borderRadius: 21,
     borderWidth: 1,
     height: 42,
     justifyContent: 'center',
     width: 42,
-  },
-  videoAction: {
-    backgroundColor: '#E56B4C',
-    borderColor: '#E56B4C',
   },
   backButton: {
     alignItems: 'center',
@@ -338,7 +342,9 @@ const styles = StyleSheet.create({
   },
   title: {
     color: '#20232A',
-    fontSize: 24,
+    // A shade under the size it used to be: the header has a back button and two call buttons
+    // to fit alongside, and a long chat id needs the extra room to stay readable.
+    fontSize: 22,
     fontWeight: '800',
   },
   emptyState: {

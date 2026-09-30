@@ -19,8 +19,11 @@ import {
   Text,
   View,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
+import { CommentSheet } from '@/components/comment-sheet';
+import { TAB_BAR_HEIGHT } from '@/components/curved-tab-bar';
+import { getFirebaseAuth, getFirebaseDb, isFirestorePermissionError } from '@/lib/firebase';
 
 interface Post {
   id: string;
@@ -92,11 +95,15 @@ function toPost(id: string, data: Record<string, unknown>): Post {
 
 function PostVideo({
   uri,
+  bottomInset,
   height,
   isActive,
   isMuted,
 }: {
   uri: string;
+  // Distance from the bottom of the post that the floating bars already cover, so the scrub
+  // readout clears them instead of landing underneath.
+  bottomInset: number;
   height: number;
   isActive: boolean;
   isMuted: boolean;
@@ -321,7 +328,7 @@ function PostVideo({
         ) : null}
 
         {isSeeking ? (
-          <View pointerEvents="none" style={styles.seekOverlay}>
+          <View pointerEvents="none" style={[styles.seekOverlay, { bottom: bottomInset + 32 }]}>
             <Text style={styles.seekTime}>
               {`${formatTime(seekSeconds)}`}
             </Text>
@@ -334,6 +341,7 @@ function PostVideo({
 
 export default function Home() {
   const isFocused = useIsFocused();
+  const insets = useSafeAreaInsets();
   const [posts, setPosts] = useState<Post[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
@@ -343,6 +351,9 @@ export default function Home() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [isScrolling, setIsScrolling] = useState(false);
   const [selectedTab, setSelectedTab] = useState('Friends');
+  // The comment sheet renders over the post instead of navigating away, so the feed keeps
+  // its scroll position and the video behind the sheet stays the same one.
+  const [commentsPostId, setCommentsPostId] = useState('');
   const scrollEndTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -414,13 +425,35 @@ export default function Home() {
     scrollEndTimer.current = setTimeout(() => setIsScrolling(false), SCROLL_SETTLE_MS);
   };
 
+  const openComments = useCallback((postId: string) => {
+    setCommentsPostId(postId);
+  }, []);
+
+  const closeComments = useCallback(() => {
+    setCommentsPostId('');
+  }, []);
+
+  // The sheet shows the counter the feed keeps on the post, so the header agrees with the
+  // number next to the comment icon even when the list below is only the newest page.
+  const commentsCount = useMemo(
+    () => posts.find((post) => post.id === commentsPostId)?.commentsCount ?? 0,
+    [commentsPostId, posts],
+  );
+
+  // The tab bar floats over the feed instead of shortening it, so everything anchored to the
+  // bottom of a post has to clear the bar itself plus the phone inset below it.
+  const bottomChrome = TAB_BAR_HEIGHT + insets.bottom;
+
   const renderItem = ({ item, index }: { item: Post; index: number }) => {
-    const isCurrentPost = isFocused && !isScrolling && index === activeIndex;
+    // The sheet covers the lower half of the post, so the video pauses while it is open
+    // instead of playing behind the comments.
+    const isCurrentPost = isFocused && !isScrolling && index === activeIndex && commentsPostId === '';
 
     return (
       <View style={[styles.itemContainer, { height: pageHeight }]}>
         {item.mediaType === 'video' ? (
           <PostVideo
+            bottomInset={bottomChrome}
             height={pageHeight}
             isActive={isCurrentPost}
             isMuted={!isCurrentPost}
@@ -436,11 +469,16 @@ export default function Home() {
 
         {/* Only the caption: the author name lives in the social bar, and repeating it
             here stacked the same @name on top of the bar. */}
-        <View style={styles.overlay}>
+        <View style={[styles.overlay, { bottom: bottomChrome + SOCIAL_BAR_HEIGHT }]}>
           <CaptionText caption={item.caption} />
         </View>
 
-        <SocialActions key={item.id} post={item} />
+        <SocialActions
+          bottomInset={bottomChrome}
+          key={item.id}
+          onOpenComments={openComments}
+          post={item}
+        />
       </View>
     );
   };
@@ -502,6 +540,13 @@ export default function Home() {
       >
         <Ionicons color="#FFFFFF" name="search" size={26} />
       </Pressable>
+
+      <CommentSheet
+        onClose={closeComments}
+        postId={commentsPostId}
+        totalCount={commentsCount}
+        visible={commentsPostId !== ''}
+      />
     </View>
   );
 }
@@ -551,9 +596,12 @@ function formatCount(value: number) {
   return `${(value / 1_000_000).toFixed(1)}M`;
 }
 
-// Matches the tab bar background so the two stack as a single block. Kept here as a
-// constant because the bar is opaque and the shadow that used to lift it is gone.
-const SOCIAL_BAR_BACKGROUND = 'rgba(30, 58, 138, 0.95)';
+// Matches the tab bar background so the two stack as a single block. The same translucent
+// black, so the video reads through both and the pair looks like one floating bar.
+const SOCIAL_BAR_BACKGROUND = 'rgba(0, 0, 0, 0.4)';
+
+// The social bar is a single row: 12px of padding above and below a 40px avatar.
+const SOCIAL_BAR_HEIGHT = 64;
 
 // Both flags live in one document at posts/{postId}/reactions/{userId}, so the viewer only
 // needs a single listener per post and a like and a love never fight over separate files.
@@ -571,14 +619,6 @@ const pendingFollows = new Map<string, Promise<boolean>>();
 
 // Set once the rules reject the follow documents; retrying can only fail again.
 let followIsDenied = false;
-
-function isPermissionError(error: unknown) {
-  const code = typeof error === 'object' && error !== null && 'code' in error
-    ? String((error as { code: unknown }).code)
-    : '';
-
-  return code === 'permission-denied' || code === 'unauthenticated';
-}
 
 function readFollow(viewerId: string, authorId: string): Promise<boolean> {
   if (followIsDenied) {
@@ -612,7 +652,7 @@ function readFollow(viewerId: string, authorId: string): Promise<boolean> {
       followCache.set(cacheId, exists);
       return exists;
     } catch (error) {
-      if (isPermissionError(error)) {
+      if (isFirestorePermissionError(error)) {
         followIsDenied = true;
         console.warn(
           'Follow state is not readable with the deployed Firestore rules. '
@@ -681,7 +721,7 @@ function usePostReactions(postId: string, viewerId: string) {
         setFlags({ liked: Boolean(own.liked), loved: Boolean(own.loved) });
       },
       (error) => {
-        if (isPermissionError(error)) {
+        if (isFirestorePermissionError(error)) {
           deniedReactionPaths.add(postId);
           setIsDenied(true);
 
@@ -736,7 +776,15 @@ function usePostReactions(postId: string, viewerId: string) {
   };
 }
 
-function SocialActions({ post }: { post: Post }) {
+function SocialActions({
+  bottomInset,
+  onOpenComments,
+  post,
+}: {
+  bottomInset: number;
+  onOpenComments: (postId: string) => void;
+  post: Post;
+}) {
   const [currentUserId, setCurrentUserId] = useState('');
   const [isFollowing, setIsFollowing] = useState(false);
   const [isMutating, setIsMutating] = useState(false);
@@ -833,7 +881,7 @@ function SocialActions({ post }: { post: Post }) {
     } catch (error) {
       rollback(key, nextValue);
 
-      if (isPermissionError(error)) {
+      if (isFirestorePermissionError(error)) {
         // The listener already told the user the path is closed, and this would otherwise
         // raise the same alert on every tap.
         if (isDenied) {
@@ -878,7 +926,7 @@ function SocialActions({ post }: { post: Post }) {
     } catch (error) {
       followCache.delete(`${currentUserId}|${authorId}`);
 
-      if (isPermissionError(error)) {
+      if (isFirestorePermissionError(error)) {
         Alert.alert(
           'Not allowed yet',
           'The deployed Firestore rules do not allow following. Deploy the updated firestore.rules and try again.',
@@ -910,7 +958,7 @@ function SocialActions({ post }: { post: Post }) {
   };
 
   return (
-    <View style={styles.socialBar}>
+    <View style={[styles.socialBar, { bottom: bottomInset }]}>
       <View style={styles.socialAuthor}>
         <View style={styles.socialAvatar}>
           <Text style={styles.socialAvatarLetter}>
@@ -944,8 +992,9 @@ function SocialActions({ post }: { post: Post }) {
               accessibilityLabel={action.key}
               accessibilityRole="button"
               // Denied rules would fail on every tap, so the button is disabled instead of
-              // raising the same alert repeatedly.
-              disabled={isMutating || isDenied}
+              // raising the same alert repeatedly. Only the reactions are closed in that
+              // case; comments live on their own path and stay reachable.
+              disabled={isMutating || (isDenied && (action.key === 'like' || action.key === 'love'))}
               key={action.key}
               onPress={() => {
                 if (action.key === 'like' || action.key === 'love') {
@@ -953,10 +1002,12 @@ function SocialActions({ post }: { post: Post }) {
                   return;
                 }
 
-                Alert.alert(
-                  action.key === 'share' ? 'Share' : 'Comment',
-                  `${formatCount(counts[action.key])} on this post`,
-                );
+                if (action.key === 'comment') {
+                  onOpenComments(post.id);
+                  return;
+                }
+
+                Alert.alert('Share', `${formatCount(counts.share)} on this post`);
               }}
               style={styles.socialIcon}
             >
@@ -1039,9 +1090,10 @@ const styles = StyleSheet.create({
   emptyText: { color: 'white', fontSize: 20, fontWeight: 'bold' },
   emptySubText: { color: 'gray', fontSize: 14, marginTop: 10 },
   itemContainer: { width: '100%' },
-  // Sits directly on top of the social bar, so the caption is raised by the bar height
-  // plus a little breathing room.
-  overlay: { position: 'absolute', bottom: 78, left: 16, right: 16, marginBottom: 10 },
+  // Sits directly on top of the social bar, so the caption is raised by the bar height plus
+  // a little breathing room. The offset itself is applied at render, because the tab bar
+  // height and the phone inset are only known on the device.
+  overlay: { position: 'absolute', left: 16, right: 16, marginBottom: 10 },
   caption: { color: '#FFFFFF', fontSize: 14, lineHeight: 19 },
   hashtag: { color: '#3B82F6' },
   indicator: {
@@ -1096,7 +1148,6 @@ const styles = StyleSheet.create({
     alignSelf: 'center',
     backgroundColor: 'rgba(0, 0, 0, 0.45)',
     borderRadius: 14,
-    bottom: 110,
     left: 20,
     paddingHorizontal: 16,
     paddingVertical: 12,
@@ -1114,6 +1165,12 @@ const styles = StyleSheet.create({
     top: 50,
     alignSelf: 'center',
     zIndex: 10,
+    // Translucent black, the same fill as the tab bar below, so the video shows through both
+    // bars. The pill shape keeps the tint from sitting as a hard band across the post.
+    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
   },
   // Same top as the tabs so the icon lines up with their labels, pinned to the right edge.
   searchButton: {
@@ -1132,17 +1189,23 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
   },
   feedTabText: {
-    color: '#9CA3AF',
+    // White at reduced opacity, so the inactive tabs stay readable over a bright frame of the
+    // video and the active one still stands out.
+    color: '#FFFFFF',
     fontSize: 16,
     fontWeight: 'bold',
+    opacity: 0.65,
   },
   feedTabTextActive: {
     color: '#FFFFFF',
+    opacity: 1,
   },
   feedTabUnderline: {
     position: 'absolute',
+    // 8 is the pill padding and 12 the tab margin, so the underline still starts under the
+    // first label rather than under the rounded edge of the pill.
     bottom: 0,
-    left: 12,
+    left: 20,
     height: 3,
     borderRadius: 2,
     backgroundColor: '#FFFFFF',
@@ -1150,10 +1213,9 @@ const styles = StyleSheet.create({
   },
   socialBar: {
     position: 'absolute',
-    // Flush with the bottom of the post, which is where the tab bar starts, so the two
-    // read as one stacked shape with no gap between them. Edge to edge: no side inset and
-    // no rounding, matching the tab bar directly below it.
-    bottom: 0,
+    // Sits on top of the tab bar rather than flush with the bottom of the post, because the
+    // bar itself now floats over the feed. Edge to edge: no side inset and no rounding, so
+    // the two read as one stacked shape.
     left: 0,
     right: 0,
     width: '100%',

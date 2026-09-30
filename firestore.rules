@@ -7,6 +7,7 @@ rules_version = '2';
 //   users/{uid}/following/{userId}  - who this user follows
 //   posts/{postId}                  - feed posts
 //   posts/{postId}/reactions/{uid}  - { liked, loved } per reacting user
+//   posts/{postId}/comments/{id}    - { userId, displayName, text, replyToName }
 //   chats/{chatId}                  - participants[] (uids), lastMessage, ...
 //   chats/{chatId}/messages/{msgId} - senderId, type, text/mediaUrl
 //
@@ -72,6 +73,24 @@ service cloud.firestore {
         allow list: if isSignedIn();
         allow create, update: if isSignedIn() && request.auth.uid == userId;
         allow delete: if isSignedIn() && request.auth.uid == userId;
+      }
+
+      // Comments are read by every signed-in user and written as their own author, the same
+      // split the reactions subcollection uses. A comment document is immutable once written,
+      // so a reply cannot be made to impersonate somebody else.
+      match /comments/{commentId} {
+        allow get, list: if isSignedIn();
+
+        allow create: if isSignedIn()
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 500;
+
+        allow update: if false;
+
+        // Only the author can take a comment back down.
+        allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
       }
     }
 

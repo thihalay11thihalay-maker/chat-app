@@ -313,7 +313,10 @@ export default function UploadScreen() {
 
       // 4. Save the post in the Firestore posts collection.
       await addDoc(collection(getFirebaseDb(), 'posts'), {
+        // Started at zero so the comment counter on the post is a real number from the
+        // first moment, which is what the transaction in lib/comments.ts reads.
         caption: caption.trim(),
+        commentsCount: 0,
         createdAt: serverTimestamp(),
         displayName: displayName || currentUser.displayName || 'User',
         mediaType: media.mediaType,

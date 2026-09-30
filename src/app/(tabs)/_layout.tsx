@@ -47,13 +47,19 @@ const TABS: (TabItem & { name: string })[] = [
   },
 ];
 
+// The feed draws a post edge to edge, so the bar has to float over it to let the video show
+// through. Every other screen is a normal scrollable page, and overlaying there would bury
+// the last row of a list under the bar.
+const OVERLAY_TAB_KEYS = new Set(['home']);
+
 export default function TabsLayout() {
   return (
     <Tabs
       screenOptions={{
         headerShown: false,
-        // The bar sits in the layout flow, so each screen has to stop above it. Without
-        // this the screen keeps the full window height and content runs under the bar.
+        // The bar sits in the layout flow on most screens, so each screen has to stop above
+        // it. Without this the screen keeps the full window height and content runs under the
+        // bar. The feed opts out below and draws its own bottom spacing instead.
         sceneStyle: { backgroundColor: '#F7F4EF' },
       }}
       tabBar={({ navigation, state }) => {
@@ -62,6 +68,7 @@ export default function TabsLayout() {
         return (
           <CurvedTabBar
             activeHref={activeTab?.href}
+            isOverlay={activeTab ? OVERLAY_TAB_KEYS.has(activeTab.key) : false}
             items={TABS}
             onSelect={(item) => navigation.navigate(item.key as never)}
           />

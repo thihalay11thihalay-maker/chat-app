@@ -122,6 +122,17 @@ export function confirmPhoneSignIn(
   return confirmationResult.confirm(verificationCode);
 }
 
+// Firestore reports a rule that closed a path as permission-denied and a missing session as
+// unauthenticated. Both are permanent for the current session, so callers remember them
+// instead of retrying and raising the same message again.
+export function isFirestorePermissionError(error: unknown) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code: unknown }).code)
+        : '';
+
+    return code === 'permission-denied' || code === 'unauthenticated';
+}
+
 export function getAuthErrorMessage(error: unknown) {
   const code = typeof error === 'object' && error !== null && 'code' in error
     ? String(error.code)

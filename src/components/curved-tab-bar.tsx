@@ -4,11 +4,12 @@ import type { ComponentProps } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-// Dark navy, nearly opaque so the video behind it does not show through. The small gap to
-// white left by full opacity looked like a seam against the dark social bar above it.
-const BAR_BACKGROUND = 'rgba(30, 58, 138, 0.95)';
-// White reads clearly on navy; the metallic blue used before sat at almost the same
-// lightness as the background and all but vanished.
+// Translucent black instead of the solid navy it used to be, so the post behind the bar
+// shows through the way it does in TikTok and Instagram. The bar draws no shadow and no
+// border: an edge against the content behind it is what makes a translucent bar look solid.
+const BAR_BACKGROUND = 'rgba(0, 0, 0, 0.4)';
+// White reads clearly on the darkened video; the inactive entries drop to 60% so the active
+// one still stands out without leaving the bar.
 const ACTIVE_COLOR = '#FFFFFF';
 const INACTIVE_COLOR = '#FFFFFF';
 const UPLOAD_COLOR = '#EF4444';
@@ -47,6 +48,11 @@ export const TAB_ITEMS: TabItem[] = [
 export type CurvedTabBarProps = {
   /** Overrides the active tab, for when the bar is driven by another navigator. */
   activeHref?: string;
+  /**
+   * Lays the bar over the screen instead of shortening it. Only safe where the screen draws
+   * its own bottom padding, and the only place that wants it is a full-bleed video feed.
+   */
+  isOverlay?: boolean;
   items?: TabItem[];
   /** Called instead of navigating, for custom handling. */
   onSelect?: (item: TabItem) => void;
@@ -56,7 +62,7 @@ function isTabActive(pathname: string, href: string) {
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
-export function CurvedTabBar({ activeHref, items = TAB_ITEMS, onSelect }: CurvedTabBarProps) {
+export function CurvedTabBar({ activeHref, isOverlay = false, items = TAB_ITEMS, onSelect }: CurvedTabBarProps) {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const routePathname = usePathname() ?? '';
@@ -73,13 +79,15 @@ export function CurvedTabBar({ activeHref, items = TAB_ITEMS, onSelect }: Curved
 
   return (
     // Kept in the normal layout flow on purpose: an absolutely positioned bar overlays the
-    // screen instead of shortening it, which is what pushed videos under the bar.
+    // screen instead of shortening it, which is what pushed videos under the bar. The feed
+    // opts out with isOverlay, because there a full-bleed post is meant to run under it.
     <View
       style={[
         styles.wrapper,
         // Only the device inset below, so the bar itself sits flush against the bottom
         // edge and clears the phone navigation bar instead of being cut off by it.
         { paddingBottom: insets.bottom },
+        isOverlay ? styles.overlay : null,
       ]}
     >
       <View style={styles.bar}>
@@ -130,8 +138,8 @@ export default CurvedTabBar;
 
 const styles = StyleSheet.create({
   wrapper: {
-    // Matches the bar so the device inset below it is the same colour. Left transparent,
-    // the safe area showed the screen underneath and broke the full-bleed edge.
+    // The same translucent fill as the bar, so the device inset below it is one continuous
+    // block and the content behind shows through both parts evenly.
     backgroundColor: BAR_BACKGROUND,
     paddingHorizontal: BAR_SIDE_GAP,
     width: '100%',
@@ -143,6 +151,18 @@ const styles = StyleSheet.create({
     height: BAR_HEIGHT,
     paddingHorizontal: 6,
     width: '100%',
+    // No shadow and no border: either one draws a hard edge that a translucent bar cannot
+    // hide, and the edge reads as a solid block.
+    elevation: 0,
+    shadowOpacity: 0,
+  },
+  overlay: {
+    bottom: 0,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    // Above the feed it covers, which is the post video and its social bar.
+    zIndex: 20,
   },
   tab: {
     alignItems: 'center',

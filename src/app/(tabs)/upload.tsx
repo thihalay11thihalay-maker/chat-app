@@ -1,3 +1,4 @@
+import { Ionicons } from '@expo/vector-icons';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { decode } from 'base64-arraybuffer';
 import { Image } from 'expo-image';
@@ -20,7 +21,9 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { MusicSearchSheet } from '@/components/music-search-sheet';
 import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
+import { MusicTrack, toPostSound } from '@/lib/music';
 import { getString } from '@/lib/user-data';
 
 const IMAGE_CONTENT_TYPE = 'image/jpeg';
@@ -166,6 +169,8 @@ export default function UploadScreen() {
     uri: string;
   } | null>(null);
   const [caption, setCaption] = useState('');
+  const [sound, setSound] = useState<MusicTrack | null>(null);
+  const [isPickingSound, setIsPickingSound] = useState(false);
   const [isPicking, setIsPicking] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
@@ -321,6 +326,10 @@ export default function UploadScreen() {
         displayName: displayName || currentUser.displayName || 'User',
         mediaType: media.mediaType,
         mediaUrl,
+        // Only copied field by field rather than spreading the search result, so a post can
+        // never carry anything the feed does not expect. The attribution fields come along
+        // because a CC BY track has to name the artist and the licence.
+        ...(sound ? { sound: toPostSound(sound) } : {}),
         userId: currentUser.uid,
       });
     } catch (error) {
@@ -346,9 +355,10 @@ export default function UploadScreen() {
     setIsUploading(false);
     setCaption('');
     setMedia(null);
+    setSound(null);
     Alert.alert('Success', 'Post uploaded successfully.');
     router.replace('/home');
-  }, [caption, currentUser, displayName, media]);
+  }, [caption, currentUser, displayName, media, sound]);
 
   const isBusy = isUploading || isPicking;
 
@@ -400,6 +410,54 @@ export default function UploadScreen() {
             )}
           </Pressable>
 
+          {/* Centred between the media and the caption: the sound belongs to the post itself,
+              so it sits in the middle of the form rather than at either end of it. */}
+          <View style={styles.soundRow}>
+            <Pressable
+              accessibilityLabel={sound ? 'Change sound' : 'Add a sound'}
+              accessibilityRole="button"
+              disabled={isBusy}
+              onPress={() => setIsPickingSound(true)}
+              style={({ pressed }) => [styles.soundButton, pressed && styles.pressed, isBusy && styles.disabled]}
+            >
+              {sound ? (
+                <>
+                  {sound.imageUrl ? (
+                    <Image contentFit="cover" source={{ uri: sound.imageUrl }} style={styles.soundCover} />
+                  ) : (
+                    <View style={[styles.soundCover, styles.soundCoverFallback]}>
+                      <Ionicons color="#FFFFFF" name="musical-notes" size={18} />
+                    </View>
+                  )}
+
+                  <View style={styles.soundText}>
+                    <Text numberOfLines={1} style={styles.soundTitle}>{sound.title}</Text>
+                    <Text numberOfLines={1} style={styles.soundArtist}>{sound.artist}</Text>
+                  </View>
+                </>
+              ) : (
+                <>
+                  <View style={styles.soundIcon}>
+                    <Ionicons color="#FFFFFF" name="musical-notes" size={18} />
+                  </View>
+                  <Text style={styles.soundPlaceholder}>Select a sound</Text>
+                </>
+              )}
+            </Pressable>
+
+            {sound ? (
+              <Pressable
+                accessibilityLabel="Remove sound"
+                accessibilityRole="button"
+                disabled={isBusy}
+                onPress={() => setSound(null)}
+                style={({ pressed }) => [styles.soundRemove, pressed && styles.pressed, isBusy && styles.disabled]}
+              >
+                <Ionicons color="#656A73" name="close" size={18} />
+              </Pressable>
+            ) : null}
+          </View>
+
           <Text style={styles.inputLabel}>Caption</Text>
           <TextInput
             editable={!isUploading}
@@ -425,6 +483,16 @@ export default function UploadScreen() {
           </Pressable>
         </ScrollView>
       </KeyboardAvoidingView>
+
+      <MusicSearchSheet
+        onClose={() => setIsPickingSound(false)}
+        onSelect={(track) => {
+          setSound(track);
+          setIsPickingSound(false);
+        }}
+        selectedId={sound?.id}
+        visible={isPickingSound}
+      />
     </SafeAreaView>
   );
 }
@@ -540,6 +608,60 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     marginTop: 20,
     textTransform: 'uppercase',
+  },
+  // The sound control is centred on its own row, between the media and the caption.
+  soundRow: {
+    alignItems: 'center',
+    alignSelf: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 18,
+  },
+  soundButton: {
+    alignItems: 'center',
+    backgroundColor: '#20232A',
+    borderRadius: 999,
+    flexDirection: 'row',
+    gap: 10,
+    maxWidth: '86%',
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  soundIcon: {
+    alignItems: 'center',
+    backgroundColor: '#E56B4C',
+    borderRadius: 16,
+    height: 32,
+    justifyContent: 'center',
+    width: 32,
+  },
+  soundPlaceholder: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
+    paddingHorizontal: 10,
+    paddingRight: 6,
+  },
+  soundCover: {
+    borderRadius: 16,
+    height: 32,
+    width: 32,
+  },
+  soundCoverFallback: {
+    alignItems: 'center',
+    backgroundColor: '#3A3F4A',
+    justifyContent: 'center',
+  },
+  soundText: { flexShrink: 1, paddingRight: 6 },
+  soundTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
+  soundArtist: { color: '#A9AEB8', fontSize: 11, marginTop: 1 },
+  soundRemove: {
+    alignItems: 'center',
+    backgroundColor: '#EDE8E0',
+    borderRadius: 16,
+    height: 32,
+    justifyContent: 'center',
+    width: 32,
   },
   input: {
     backgroundColor: '#FFFFFF',

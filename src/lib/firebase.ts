@@ -1,3 +1,4 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getApp, getApps, initializeApp } from 'firebase/app';
 import {
     Auth,
@@ -5,7 +6,9 @@ import {
     createUserWithEmailAndPassword,
     signInWithPhoneNumber as firebaseSignInWithPhoneNumber,
     getAuth,
+    getReactNativePersistence,
     GoogleAuthProvider,
+    initializeAuth,
     RecaptchaVerifier,
     signInWithEmailAndPassword,
     signInWithPopup,
@@ -57,7 +60,32 @@ function getFirebaseApp() {
 export function getFirebaseAuth() {
   if (auth) return auth;
 
-  auth = getAuth(getFirebaseApp());
+  const app = getFirebaseApp();
+
+  // React Native has no localStorage for the auth SDK to fall back on. getAuth would then
+  // start in memory, so every app restart looked like a sign-out and warned about it, so the
+  // session is written to AsyncStorage instead.
+  //
+  // Two ways this is skipped. On the web the browser build of the SDK already persists
+  // through localStorage and IndexedDB, and it does not ship this helper at all. The runtime
+  // check covers a bundle built against the browser build, where calling it would throw.
+  const canPersistOnDevice = Platform.OS !== 'web' && typeof getReactNativePersistence === 'function';
+
+  if (!canPersistOnDevice) {
+    auth = getAuth(app);
+    return auth;
+  }
+
+  // initializeAuth throws if this app already has an auth instance, which happens when
+  // something reached for getAuth before this module did. The existing instance is the same
+  // one, so it is kept rather than crashing the screen.
+  try {
+    auth = initializeAuth(app, { persistence: getReactNativePersistence(AsyncStorage) });
+  } catch (error) {
+    console.warn('Falling back to the default auth persistence:', error);
+    auth = getAuth(app);
+  }
+
   return auth;
 }
 

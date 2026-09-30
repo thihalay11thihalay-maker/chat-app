@@ -1,8 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
+import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { router, useIsFocused } from 'expo-router';
 import { Image } from 'expo-image';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import { collection, deleteDoc, doc, getDoc, onSnapshot, orderBy, query, serverTimestamp, setDoc, Timestamp } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp } from 'firebase/firestore';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -14,7 +15,9 @@ import {
   NativeScrollEvent,
   NativeSyntheticEvent,
   PanResponder,
+  Platform,
   Pressable,
+  Share,
   StyleSheet,
   Text,
   View,
@@ -24,6 +27,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CommentSheet } from '@/components/comment-sheet';
 import { TAB_BAR_HEIGHT } from '@/components/curved-tab-bar';
 import { getFirebaseAuth, getFirebaseDb, isFirestorePermissionError } from '@/lib/firebase';
+import { PostSound, resolveStreamUrl, toPostSoundValue } from '@/lib/music';
 
 interface Post {
   id: string;
@@ -36,6 +40,7 @@ interface Post {
   lovesCount: number;
   likesCount: number;
   sharesCount: number;
+  sound?: PostSound;
   userId: string;
 }
 
@@ -89,6 +94,9 @@ function toPost(id: string, data: Record<string, unknown>): Post {
     mediaType: mediaType === 'image' || mediaType === 'video' ? mediaType : undefined,
     mediaUrl: typeof data.mediaUrl === 'string' ? data.mediaUrl : undefined,
     sharesCount: toCount(data, 'sharesCount'),
+    // A post without a usable sound object is treated as having no sound, so one bad document
+    // cannot break the row.
+    sound: toPostSoundValue(data.sound) ?? undefined,
     userId: typeof data.userId === 'string' ? data.userId : '',
   };
 }
@@ -339,6 +347,139 @@ function PostVideo({
   );
 }
 
+// The attached song plays under the post, like the audio track on a TikTok. It sits well
+// below the video's own audio so the two do not fight for attention.
+const SOUND_VOLUME = 0.4;
+
+function PostSoundLabelRow({
+  isMuted,
+  onToggleMute,
+  sound,
+}: {
+  isMuted: boolean;
+  onToggleMute: () => void;
+  sound: PostSound;
+}) {
+  return (
+    <Pressable
+      accessibilityLabel={isMuted ? 'Unmute sound' : 'Mute sound'}
+      accessibilityRole="button"
+      onPress={onToggleMute}
+      style={styles.soundLabel}
+    >
+      <Ionicons
+        color={isMuted ? '#9CA3AF' : '#FFFFFF'}
+        name={isMuted ? 'volume-mute' : 'musical-notes'}
+        size={13}
+      />
+      {/* The artist and the title credit the artist the track came from. */}
+      <Text numberOfLines={1} style={styles.soundLabelText}>
+        {`${sound.artist} · ${sound.title}`}
+      </Text>
+    </Pressable>
+  );
+}
+
+// Split from PostSoundRow so the player is only created for posts that actually have a sound:
+// hooks cannot be conditional, and a row without music should not hold an audio object.
+function PostSoundPlayer({ isActive, isMuted, onToggleMute, sound }: {
+  isActive: boolean;
+  isMuted: boolean;
+  onToggleMute: () => void;
+  sound: PostSound;
+}) {
+  // Starts empty because Audius hands out a signed link per track, not in the search result.
+  const player = useAudioPlayer(null);
+  const [streamUrl, setStreamUrl] = useState('');
+  const replacedUrl = useRef('');
+
+  // The link saved on the post is a track id, so the audio is resolved when the post is first
+  // watched. It waits for the post to be on screen, which keeps a long feed from asking
+  // Audius for tracks nobody has scrolled to yet.
+  useEffect(() => {
+    if (!isActive || streamUrl || !sound.isStreamable) {
+      return;
+    }
+
+    let ignored = false;
+
+    resolveStreamUrl(sound.id)
+      .then((url) => {
+        // The lookup is cached by id, so a result dropped because the post scrolled away costs
+        // nothing the next time it is watched.
+        if (!ignored) {
+          setStreamUrl(url);
+        }
+      })
+      .catch((error) => {
+        console.warn('Could not load the sound for this post:', error);
+      });
+
+    return () => {
+      ignored = true;
+    };
+  }, [isActive, sound.id, sound.isStreamable, streamUrl]);
+
+  // A fresh link every time: Audius URLs carry a signature that stops working later, so the
+  // player is pointed at a new one rather than replaying a stale one.
+  useEffect(() => {
+    if (!streamUrl || replacedUrl.current === streamUrl) {
+      return;
+    }
+
+    player.replace({ uri: streamUrl });
+    replacedUrl.current = streamUrl;
+  }, [player, streamUrl]);
+
+  // The volume is set on the object rather than at play time, so it also holds after the
+  // platform applies its own default on a fresh load.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability -- the player is an imperative native object, not render data.
+    player.volume = SOUND_VOLUME;
+    // Songs are short and a post can be scrolled back to later, so the track loops for as
+    // long as the post is on screen.
+    player.loop = true;
+  }, [player]);
+
+  // Only the post filling the screen plays, and the feed mutes everything while it moves, so
+  // two songs are never on top of each other. Nothing plays until a link is in hand.
+  useEffect(() => {
+    if (isActive && !isMuted && streamUrl) {
+      player.play();
+      return;
+    }
+
+    player.pause();
+  }, [isActive, isMuted, player, streamUrl]);
+
+  return <PostSoundLabelRow isMuted={isMuted} onToggleMute={onToggleMute} sound={sound} />;
+}
+
+function PostSoundRow({
+  isActive,
+  isMuted,
+  onToggleMute,
+  sound,
+}: {
+  isActive: boolean;
+  isMuted: boolean;
+  onToggleMute: () => void;
+  sound?: PostSound;
+}) {
+  if (!sound) {
+    return null;
+  }
+
+  return (
+    <PostSoundPlayer
+      isActive={isActive}
+      isMuted={isMuted}
+      onToggleMute={onToggleMute}
+      sound={sound}
+    />
+  );
+}
+
 export default function Home() {
   const isFocused = useIsFocused();
   const insets = useSafeAreaInsets();
@@ -354,6 +495,9 @@ export default function Home() {
   // The comment sheet renders over the post instead of navigating away, so the feed keeps
   // its scroll position and the video behind the sheet stays the same one.
   const [commentsPostId, setCommentsPostId] = useState('');
+  // One switch for the whole feed, like the sound toggle in a short-video app: tapping the
+  // song label silences every post, not just the one on screen.
+  const [isSoundMuted, setIsSoundMuted] = useState(false);
   const scrollEndTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -362,6 +506,15 @@ export default function Home() {
         clearTimeout(scrollEndTimer.current);
       }
     };
+  }, []);
+
+  useEffect(() => {
+    // A post can carry its own song while its video still has its audio, so the two have to
+    // mix instead of one interrupting the other. The rest of the audio mode is left alone,
+    // since the ring switch behaviour is shared with the chat voice notes.
+    setAudioModeAsync({ interruptionMode: 'mixWithOthers' }).catch((error) => {
+      console.warn('Could not set the audio mode:', error);
+    });
   }, []);
 
   useEffect(() => {
@@ -433,6 +586,10 @@ export default function Home() {
     setCommentsPostId('');
   }, []);
 
+  const toggleSoundMute = useCallback(() => {
+    setIsSoundMuted((current) => !current);
+  }, []);
+
   // The sheet shows the counter the feed keeps on the post, so the header agrees with the
   // number next to the comment icon even when the list below is only the newest page.
   const commentsCount = useMemo(
@@ -470,6 +627,12 @@ export default function Home() {
         {/* Only the caption: the author name lives in the social bar, and repeating it
             here stacked the same @name on top of the bar. */}
         <View style={[styles.overlay, { bottom: bottomChrome + SOCIAL_BAR_HEIGHT }]}>
+          <PostSoundRow
+            isActive={isCurrentPost}
+            isMuted={isSoundMuted}
+            onToggleMute={toggleSoundMute}
+            sound={item.sound}
+          />
           <CaptionText caption={item.caption} />
         </View>
 
@@ -776,6 +939,60 @@ function usePostReactions(postId: string, viewerId: string) {
   };
 }
 
+// A completed share is counted on the post document, which is where the feed reads the number
+// from. Read and set rather than incremented, because a post created before sharing existed
+// carries no counter field at all. The feed listener pushes the new value back down, so the
+// icon needs no local state of its own.
+async function recordShare(postId: string) {
+  const db = getFirebaseDb();
+  const postRef = doc(db, 'posts', postId);
+
+  await runTransaction(db, async (transaction) => {
+    const post = await transaction.get(postRef);
+    const stored = post.exists() ? post.data().sharesCount : undefined;
+    const count = typeof stored === 'number' && Number.isFinite(stored) ? stored : 0;
+
+    transaction.update(postRef, { sharesCount: count + 1 });
+  });
+}
+
+// react-native-web rejects the call outright in a browser without the Web Share API, so the
+// capability is checked before sharing rather than caught after the fact.
+function canOpenShareSheet() {
+  if (Platform.OS !== 'web') {
+    return true;
+  }
+
+  return typeof navigator !== 'undefined' && typeof navigator.share === 'function';
+}
+
+// Fallback for a browser that cannot open a share sheet. The media link is the whole post, so
+// putting it on the clipboard is the one thing that still lets it leave the app.
+async function copyPostLink(text: string) {
+  if (Platform.OS !== 'web' || typeof navigator === 'undefined' || !navigator.clipboard) {
+    return false;
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (error) {
+    console.warn('The clipboard was not available:', error);
+    return false;
+  }
+}
+
+// react-native-web stubs Alert.alert to a no-op, so on web a message the user has to act on
+// would simply vanish. The browser dialog is used there instead.
+function notify(title: string, message: string) {
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && typeof window.alert === 'function') {
+    window.alert(`${title}\n\n${message}`);
+    return;
+  }
+
+  Alert.alert(title, message);
+}
+
 function SocialActions({
   bottomInset,
   onOpenComments,
@@ -788,6 +1005,7 @@ function SocialActions({
   const [currentUserId, setCurrentUserId] = useState('');
   const [isFollowing, setIsFollowing] = useState(false);
   const [isMutating, setIsMutating] = useState(false);
+  const [isSharing, setIsSharing] = useState(false);
   const {
     applyOptimistic,
     counts: reactionCounts,
@@ -941,6 +1159,68 @@ function SocialActions({
     }
   };
 
+  // The native share sheet is opened with the media link plus the caption, which is the part
+  // people paste into a message. expo-sharing is not used: it needs a local file, and it adds
+  // a native module, while the link already points at the public media URL.
+  const sharePost = async () => {
+    if (isSharing) {
+      return;
+    }
+
+    const mediaUrl = post.mediaUrl?.trim() ?? '';
+    const caption = post.caption?.trim() ?? '';
+    const message = [caption, mediaUrl].filter(Boolean).join('\n\n');
+
+    if (!message) {
+      notify('Nothing to share', 'This post has no caption or media link yet.');
+      return;
+    }
+
+    setIsSharing(true);
+
+    // A browser with no share sheet goes straight to the clipboard, so the tap still does
+    // something useful instead of reporting a failure the user cannot act on.
+    if (!canOpenShareSheet()) {
+      const copied = await copyPostLink(mediaUrl || message);
+
+      setIsSharing(false);
+
+      if (copied) {
+        notify('Link copied', 'This browser cannot open a share sheet, so the link to this post is on your clipboard.');
+      } else {
+        notify('Sharing not available', 'This browser can neither share nor copy the link.');
+      }
+
+      return;
+    }
+
+    try {
+      const result = await Share.share({ message, title: caption || 'Convo' });
+
+      // Resolving does not always mean the post was sent: iOS reports a dismissed sheet, and
+      // only a completed share is worth a count. Android always reports sharedAction, so a
+      // share cancelled there still counts.
+      if (result.action === Share.dismissedAction) {
+        return;
+      }
+
+      await recordShare(post.id);
+    } catch (error) {
+      console.error('Could not share the post:', error);
+
+      // The sheet can still fail on a device: a target app that rejects the intent, or a
+      // browser that only offers the API in a secure context it has not been given yet.
+      if (await copyPostLink(mediaUrl || message)) {
+        notify('Link copied', 'The link to this post is on your clipboard.');
+        return;
+      }
+
+      notify('Could not share', 'Please try again in a moment.');
+    } finally {
+      setIsSharing(false);
+    }
+  };
+
   const isOwnPost = Boolean(currentUserId) && currentUserId === authorId;
   const active: Record<SocialActionKey, boolean> = {
     comment: false,
@@ -993,8 +1273,11 @@ function SocialActions({
               accessibilityRole="button"
               // Denied rules would fail on every tap, so the button is disabled instead of
               // raising the same alert repeatedly. Only the reactions are closed in that
-              // case; comments live on their own path and stay reachable.
-              disabled={isMutating || (isDenied && (action.key === 'like' || action.key === 'love'))}
+              // case; comments live on their own path and stay reachable. Share is held only
+              // while the sheet is open, so a second tap cannot queue another one.
+              disabled={isMutating
+                || (isDenied && (action.key === 'like' || action.key === 'love'))
+                || (action.key === 'share' && isSharing)}
               key={action.key}
               onPress={() => {
                 if (action.key === 'like' || action.key === 'love') {
@@ -1007,7 +1290,7 @@ function SocialActions({
                   return;
                 }
 
-                Alert.alert('Share', `${formatCount(counts.share)} on this post`);
+                void sharePost();
               }}
               style={styles.socialIcon}
             >
@@ -1095,6 +1378,16 @@ const styles = StyleSheet.create({
   // height and the phone inset are only known on the device.
   overlay: { position: 'absolute', left: 16, right: 16, marginBottom: 10 },
   caption: { color: '#FFFFFF', fontSize: 14, lineHeight: 19 },
+  soundLabel: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    gap: 5,
+    marginBottom: 6,
+    maxWidth: '100%',
+    paddingVertical: 2,
+  },
+  soundLabelText: { color: '#FFFFFF', flexShrink: 1, fontSize: 12, fontWeight: '600' },
   hashtag: { color: '#3B82F6' },
   indicator: {
     alignItems: 'center',

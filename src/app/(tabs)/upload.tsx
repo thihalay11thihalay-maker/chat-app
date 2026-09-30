@@ -1,5 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import Slider from '@react-native-community/slider';
 import { decode } from 'base64-arraybuffer';
 import { CameraType, CameraView, FlashMode, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { Image } from 'expo-image';
@@ -32,21 +33,29 @@ const IMAGE_CONTENT_TYPE = 'image/jpeg';
 const VIDEO_CONTENT_TYPE = 'video/mp4';
 const UPLOAD_ATTEMPTS = 3;
 
-const CLIP_LENGTHS = ['15s', '60s', '3m'] as const;
+type UploadMode = 'PHOTO' | 'TEXT' | 'VIDEO';
 
-// Recording stops at whichever of these the user picked, in seconds. expo-camera takes the
-// limit in seconds and stops on its own when it is reached.
+// Order is the order the pills appear in, left to right. 15s is the default selection, so it
+// is named rather than read off the front of this list. expo-camera takes the cap in seconds
+// and stops on its own when it is reached.
+const CLIP_LENGTHS = ['3m', '60s', '15s'] as const;
+
 const CLIP_SECONDS: Record<(typeof CLIP_LENGTHS)[number], number> = {
   '15s': 15,
   '3m': 180,
   '60s': 60,
 };
 
-// expo-camera takes zoom as a 0 to 1 fraction of the device's maximum, and it clamps
-// anything outside that itself. The bar steps through it in tenths.
-const MIN_ZOOM = 0;
-const MAX_ZOOM = 1;
-const ZOOM_STEP = 0.1;
+// The stops under the zoom slider, left to right. expo-camera's zoom is a 0 to 1 fraction of
+// whatever the device's own maximum is, and SDK 57 exposes no way to ask for that maximum, so
+// these are positions along the slider rather than measured magnifications: on a phone with a
+// periscope lens the top stop really is far more than 3x, and on one without it the top stop is
+// well under 3x. Swapping the labels for real multiples needs the device maximum first.
+const ZOOM_STOPS = [
+  { label: '1x', value: 0 },
+  { label: '2x', value: 0.5 },
+  { label: '3x', value: 1 },
+] as const;
 
 // The flash cycles through these in order when its tool is tapped.
 const FLASH_CYCLE = ['off', 'on', 'auto'] as const;
@@ -225,25 +234,22 @@ export default function UploadScreen() {
   const [isPicking, setIsPicking] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
-  // Camera state. The mode pills drive the camera itself: PHOTO takes a picture, the
-  // durations record a video capped at the chosen length.
-  const [mediaMode, setMediaMode] = useState<'video' | 'photo'>('video');
-  const [clipLength, setClipLength] = useState<'15s' | '60s' | '3m'>('15s');
-  // The caption is a second step: POST opens this, and DONE in the caption bar is what runs
-  // the upload. Keeps the camera view clear of a keyboard-eating text field.
+  // One selection for the whole row. VIDEO is entered by picking a duration, PHOTO and TEXT by
+  // picking those pills, and because the highlight is read off this single value only one pill
+  // in the row can be lit at a time. It opens on PHOTO, so the durations start unlit.
+  const [selectedMode, setSelectedMode] = useState<UploadMode>('PHOTO');
+  const [selectedDuration, setSelectedDuration] = useState<(typeof CLIP_LENGTHS)[number]>('15s');
+  // The caption is a second step: DONE in the caption bar is what runs the upload. Keeps the
+  // camera view clear of a keyboard-eating text field.
   const [showCaptionInput, setShowCaptionInput] = useState(false);
 
   const [facing, setFacing] = useState<CameraType>('back');
-  const [zoom, setZoom] = useState(MIN_ZOOM);
+  // 0 is the wide camera, 1 is the device's own maximum. The slider writes here and the camera
+  // reads it, so a half dragged thumb and a tapped 2x stop land on the same value.
+  const [zoom, setZoom] = useState(0);
   const [flash, setFlash] = useState<FlashMode>(FLASH_CYCLE[0]);
   const [timer, setTimer] = useState<number>(TIMER_CYCLE[0]);
   const [showGrid, setShowGrid] = useState(false);
-  // Seconds left on the countdown, or null when nothing is counting. It reaches 0 for one
-  // tick before the capture runs, so the number never shows a 0.
-  const [countdown, setCountdown] = useState<number | null>(null);
-  // Mirrors the zoom level, so a burst of taps always steps from the level that is on screen
-  // rather than from a value captured in an older render.
-  const zoomRef = useRef(zoom);
   const [isRecording, setIsRecording] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   const [isCameraReady, setIsCameraReady] = useState(false);
@@ -313,7 +319,7 @@ export default function UploadScreen() {
       const result = await ImagePicker.launchImageLibraryAsync({
         allowsEditing: false,
         base64: true,
-        mediaTypes: mediaMode === 'photo' ? ['images'] : ['images', 'videos'],
+        mediaTypes: selectedMode === 'PHOTO' ? ['images'] : ['images', 'videos'],
         quality: 1,
       });
 
@@ -342,7 +348,7 @@ export default function UploadScreen() {
     } finally {
       setIsPicking(false);
     }
-  }, [mediaMode]);
+  }, [selectedMode]);
 
   // Asks for the camera, and the microphone too when a clip is about to be recorded with
   // sound. Resolves false when a permission was refused, so the caller can say so instead of
@@ -439,7 +445,7 @@ export default function UploadScreen() {
     setIsRecording(true);
 
     try {
-      const recording = cameraRef.current.recordAsync({ maxDuration: CLIP_SECONDS[clipLength] });
+      const recording = cameraRef.current.recordAsync({ maxDuration: CLIP_SECONDS[selectedDuration] });
       const result = await recording;
 
       // Undefined means the camera was stopped without producing a file, for example by
@@ -461,38 +467,18 @@ export default function UploadScreen() {
     } finally {
       setIsRecording(false);
     }
-  }, [clipLength, ensureCameraPermissions, isCapturing, isRecording]);
+  }, [selectedDuration, ensureCameraPermissions, isCapturing, isRecording]);
 
-  // What the shutter actually does once any countdown is out of the way.
-  const startCapture = useCallback(() => {
-    if (mediaMode === 'photo') {
+  // What the record button does: one shot in photo mode, otherwise a recording that the same
+  // button stops.
+  const onRecordPress = useCallback(() => {
+    if (selectedMode === 'PHOTO') {
       void capturePhoto();
       return;
     }
 
     void toggleRecording();
-  }, [capturePhoto, mediaMode, toggleRecording]);
-
-  const onShutterPress = useCallback(() => {
-    // With something already captured the shutter starts over, which is how a camera app
-    // behaves: the first press drops back to the viewfinder, the next one shoots.
-    if (media) {
-      setMedia(null);
-      return;
-    }
-
-    // A second press mid countdown would start a second one, so it does nothing.
-    if (countdown !== null) {
-      return;
-    }
-
-    if (timer > 0) {
-      setCountdown(timer);
-      return;
-    }
-
-    startCapture();
-  }, [countdown, media, startCapture, timer]);
+  }, [capturePhoto, selectedMode, toggleRecording]);
 
   // Off, on, auto, then back to off.
   const cycleFlash = useCallback(() => {
@@ -510,56 +496,14 @@ export default function UploadScreen() {
     });
   }, []);
 
-  // Drives the countdown one second at a time, then runs the capture. Both state updates sit
-  // inside the timeout rather than in the effect body, and the timeout is cleared on every
-  // change and on unmount, so leaving the screen or changing the timer mid countdown never
-  // fires a capture in the background.
-  useEffect(() => {
-    if (countdown === null) {
-      return undefined;
-    }
-
-    const timeout = setTimeout(() => {
-      if (countdown <= 1) {
-        setCountdown(null);
-        startCapture();
-        return;
-      }
-
-      setCountdown(countdown - 1);
-    }, 1000);
-
-    return () => clearTimeout(timeout);
-  }, [countdown, startCapture]);
-
-  // One entry point for every zoom change, so the ref the buttons read can never drift from
-  // the state the camera is given.
-  const applyZoom = useCallback((value: number) => {
-    const next = Math.min(Math.max(value, MIN_ZOOM), MAX_ZOOM);
-    zoomRef.current = next;
-    setZoom(next);
-  }, []);
-
-  // Flipping while recording would stop the recording halfway, so it is ignored until the
-  // clip is saved. Zoom goes back to 1x with the flip, because the front and back cameras
-  // reach different magnifications and a level carried over would look wrong on one of them.
+  // Flipping mid recording would stop the clip halfway, so it waits until the clip is saved.
   const flipCamera = useCallback(() => {
     if (isRecording) {
       return;
     }
 
     setFacing((current) => (current === 'back' ? 'front' : 'back'));
-    applyZoom(MIN_ZOOM);
-  }, [applyZoom, isRecording]);
-
-  // Rounded to a tenth on the way in, so repeated taps cannot drift into 0.30000000000000004
-  // and leave the bar sitting a hair off the level it claims.
-  const stepZoom = useCallback(
-    (delta: number) => {
-      applyZoom(Math.round((zoomRef.current + delta) / ZOOM_STEP) * ZOOM_STEP);
-    },
-    [applyZoom]
-  );
+  }, [isRecording]);
 
   const uploadPost = useCallback(async () => {
     if (!currentUser) {
@@ -725,7 +669,7 @@ export default function UploadScreen() {
             <CameraView
               facing={facing}
               flash={flash}
-              mode={mediaMode === 'photo' ? 'picture' : 'video'}
+              mode={selectedMode === 'PHOTO' ? 'picture' : 'video'}
               onCameraReady={() => setIsCameraReady(true)}
               onMountError={(event) => {
                 setIsCameraReady(false);
@@ -765,22 +709,10 @@ export default function UploadScreen() {
             </View>
           ) : null}
 
-          {countdown !== null && countdown > 0 ? (
-            <View pointerEvents="none" style={styles.countdownOverlay}>
-              <Text style={styles.countdownText}>{countdown}</Text>
-            </View>
-          ) : null}
-
-          {zoom > 0 ? (
-            <View pointerEvents="none" style={styles.zoomBadge}>
-              <Text style={styles.zoomBadgeText}>{`${(1 + zoom).toFixed(1)}x`}</Text>
-            </View>
-          ) : null}
-
           {isRecording ? (
             <View pointerEvents="none" style={styles.recordingBadge}>
               <View style={styles.recordingDot} />
-              <Text style={styles.recordingText}>{`Recording, up to ${clipLength}`}</Text>
+              <Text style={styles.recordingText}>{`Recording, up to ${selectedDuration}`}</Text>
             </View>
           ) : null}
 
@@ -796,6 +728,10 @@ export default function UploadScreen() {
 
         <ScrollView
           contentContainerStyle={styles.toolRailContent}
+          // box-none: the rail's own box is wider than its six icons, and the gaps between them
+          // are empty. Without this the rail would swallow every touch in that strip instead of
+          // letting it reach the viewfinder behind, while the buttons still take their own.
+          pointerEvents="box-none"
           showsVerticalScrollIndicator={false}
           style={styles.toolRail}
         >
@@ -883,165 +819,176 @@ export default function UploadScreen() {
         </Text>
       ) : null}
 
-      {/* Bottom cluster, in normal flow from here down: mode row, shutter row, caption bar,
-          then the POST and CREATE row. Absolute offsets kept colliding with the shutter row
-          because every number had to be measured against the screen bottom. */}
-      <View style={styles.modeRow}>
-        {CLIP_LENGTHS.map((length) => (
-          <Pressable
-            key={length}
-            accessibilityRole="button"
-            onPress={() => setClipLength(length)}
-            style={[styles.modePill, clipLength === length && styles.modePillActive]}
-          >
-            <Text style={[styles.modePillText, clipLength === length && styles.modePillTextActive]}>
-              {length}
-            </Text>
-          </Pressable>
-        ))}
-
-        <Pressable
-          accessibilityRole="button"
-          onPress={() => {
-            setMediaMode(mediaMode === 'photo' ? 'video' : 'photo');
-            setMedia(null);
-          }}
-          style={[styles.modePill, mediaMode === 'photo' && styles.modePillActive]}
-        >
-          <Text style={[styles.modePillText, mediaMode === 'photo' && styles.modePillTextActive]}>PHOTO</Text>
-        </Pressable>
-
-        <Pressable accessibilityRole="button" onPress={() => comingSoon('Text')} style={styles.modePill}>
-          <Text style={styles.modePillText}>TEXT</Text>
-        </Pressable>
-      </View>
-
-      {/* Zoom bar, directly above the shutter row. Only rendered while the viewfinder is up:
-          with a photo or clip already captured there is no camera for it to move. */}
-      {!media && cameraPermission?.granted ? (
+      {/* Bottom cluster. Every row below is a normal flow child of this one and the gap on the
+          cluster is the only spacing between them, so the effects carousel cannot land on top
+          of the record button the way a hand tuned absolute offset did. */}
+      <View style={styles.bottomCluster}>
+        {/* Zoom slider, immediately above the pill row. Rendered unconditionally rather than
+            only while the viewfinder is up: hiding it would reflow every row under it the
+            moment a photo was captured. With a clip showing it is inert, and the zoom it holds
+            applies again as soon as the viewfinder comes back. */}
         <View style={styles.zoomRow}>
+          <Slider
+            accessibilityLabel="Zoom"
+            maximumTrackTintColor="rgba(255, 255, 255, 0.3)"
+            maximumValue={1}
+            minimumTrackTintColor="rgba(255, 255, 255, 0.9)"
+            minimumValue={0}
+            onValueChange={setZoom}
+            step={0.01}
+            style={styles.zoomSlider}
+            thumbTintColor="#FFFFFF"
+            value={zoom}
+          />
+
+          <View style={styles.zoomLabels}>
+            {ZOOM_STOPS.map((stop) => {
+              const isActive = Math.abs(zoom - stop.value) < 0.02;
+
+              return (
+                <Pressable
+                  key={stop.label}
+                  accessibilityLabel={`Zoom ${stop.label}`}
+                  accessibilityRole="button"
+                  hitSlop={10}
+                  onPress={() => setZoom(stop.value)}
+                  style={styles.zoomLabelHit}
+                >
+                  <Text style={[styles.zoomLabel, isActive && styles.zoomLabelActive]}>{stop.label}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+        {/* One row, one selection. A duration is lit only while VIDEO is the mode and it is the
+            chosen one; PHOTO and TEXT are lit only when they are the mode. That is what keeps
+            exactly one pill lit, without a separate flag saying which one owns the highlight. */}
+        <View style={styles.modeRow}>
+          {CLIP_LENGTHS.map((length) => {
+            const isActive = selectedMode === 'VIDEO' && selectedDuration === length;
+
+            return (
+              <Pressable
+                key={length}
+                accessibilityLabel={`${length} clip`}
+                accessibilityRole="button"
+                onPress={() => {
+                  setSelectedMode('VIDEO');
+                  setSelectedDuration(length);
+                  setMedia(null);
+                }}
+                style={[styles.modePill, isActive && styles.modePillActive]}
+              >
+                <Text style={[styles.modePillText, isActive && styles.modePillTextActive]}>{length}</Text>
+              </Pressable>
+            );
+          })}
+
           <Pressable
-            accessibilityLabel="Zoom out"
+            accessibilityLabel="Photo mode"
             accessibilityRole="button"
-            disabled={zoom <= MIN_ZOOM}
-            hitSlop={8}
-            onPress={() => stepZoom(-ZOOM_STEP)}
-            style={styles.zoomButton}
+            onPress={() => {
+              setSelectedMode('PHOTO');
+              setMedia(null);
+            }}
+            style={[styles.modePill, selectedMode === 'PHOTO' && styles.modePillActive]}
           >
-            <Ionicons
-              color={zoom <= MIN_ZOOM ? 'rgba(255, 255, 255, 0.3)' : '#FFFFFF'}
-              name="remove-circle-outline"
-              size={28}
-            />
+            <Text style={[styles.modePillText, selectedMode === 'PHOTO' && styles.modePillTextActive]}>PHOTO</Text>
           </Pressable>
 
-          <View style={styles.zoomTrack}>
-            <View style={[styles.zoomFill, { width: `${zoom * 100}%` }]} />
-          </View>
-
           <Pressable
-            accessibilityLabel="Zoom in"
+            accessibilityLabel="Text mode"
             accessibilityRole="button"
-            disabled={zoom >= MAX_ZOOM}
-            hitSlop={8}
-            onPress={() => stepZoom(ZOOM_STEP)}
-            style={styles.zoomButton}
+            onPress={() => {
+              setSelectedMode('TEXT');
+              setMedia(null);
+            }}
+            style={[styles.modePill, selectedMode === 'TEXT' && styles.modePillActive]}
           >
-            <Ionicons
-              color={zoom >= MAX_ZOOM ? 'rgba(255, 255, 255, 0.3)' : '#FFFFFF'}
-              name="add-circle-outline"
-              size={28}
-            />
+            <Text style={[styles.modePillText, selectedMode === 'TEXT' && styles.modePillTextActive]}>TEXT</Text>
           </Pressable>
         </View>
-      ) : null}
 
-      <View style={styles.shutterRow}>
-        <Pressable
-          accessibilityLabel="Open gallery"
-          accessibilityRole="button"
-          disabled={isBusy}
-          onPress={() => void pickMedia()}
-          style={[styles.galleryButton, isBusy && styles.disabled]}
-        >
-          {media ? (
-            <Image contentFit="cover" source={{ uri: media.uri }} style={styles.galleryImage} />
-          ) : (
-            <Ionicons color="#FFFFFF" name="images-outline" size={22} />
-          )}
-        </Pressable>
+        {showCaptionInput ? (
+          <View style={styles.captionBar}>
+            <TextInput
+              editable={!isUploading}
+              maxLength={220}
+              onChangeText={setCaption}
+              placeholder="Write a caption..."
+              placeholderTextColor="rgba(255, 255, 255, 0.5)"
+              style={styles.captionField}
+              value={caption}
+            />
+            <Pressable
+              accessibilityLabel="Upload post"
+              accessibilityRole="button"
+              disabled={isBusy}
+              onPress={() => void uploadPost()}
+              style={({ pressed }) => [styles.captionDone, pressed && styles.pressed, isBusy && styles.disabled]}
+            >
+              {isUploading ? (
+                <ActivityIndicator color="#FFFFFF" />
+              ) : (
+                <Text style={styles.captionDoneText}>DONE</Text>
+              )}
+            </Pressable>
+          </View>
+        ) : null}
+      </View>
+
+      {/* Bottom bar: album on the left, the record button dead centre, POST on the right. The
+          two sides are equal flex slots so the circle lands in the middle of the bar whatever
+          the album and the word measure. */}
+      <View style={styles.bottomBar}>
+        <View style={styles.bottomBarSide}>
+          <Pressable
+            accessibilityLabel="Open gallery"
+            accessibilityRole="button"
+            disabled={isBusy}
+            onPress={() => void pickMedia()}
+            style={({ pressed }) => [styles.albumButton, pressed && styles.pressed, isBusy && styles.disabled]}
+          >
+            {media ? (
+              <Image contentFit="cover" source={{ uri: media.uri }} style={styles.albumImage} />
+            ) : (
+              <Ionicons color="#FFFFFF" name="images-outline" size={20} />
+            )}
+          </Pressable>
+        </View>
 
         <Pressable
-          accessibilityLabel={isRecording ? 'Stop recording' : countdown !== null ? 'Cancel countdown' : media ? 'Retake' : 'Record'}
+          accessibilityLabel={
+            isRecording
+              ? 'Stop recording'
+              : selectedMode === 'PHOTO'
+                ? 'Take a photo'
+                : `Record a ${selectedDuration} clip`
+          }
           accessibilityRole="button"
-          disabled={!media && (!isCameraReady || countdown !== null)}
-          onPress={onShutterPress}
+          disabled={!media && (!isCameraReady || !cameraPermission?.granted)}
+          onPress={onRecordPress}
           style={({ pressed }) => [styles.shutterOuter, pressed && styles.pressed]}
         >
           <View style={[styles.shutterInner, isRecording && styles.shutterInnerRecording]} />
         </Pressable>
 
-        <Pressable
-          accessibilityLabel="Effects"
-          accessibilityRole="button"
-          onPress={() => comingSoon('Effects')}
-          style={styles.galleryButton}
-        >
-          <Ionicons color="#FFFFFF" name="sparkles-outline" size={22} />
-        </Pressable>
-      </View>
-
-      {showCaptionInput ? (
-        <View style={styles.captionBar}>
-          <TextInput
-            editable={!isUploading}
-            maxLength={220}
-            onChangeText={setCaption}
-            placeholder="Write a caption..."
-            placeholderTextColor="rgba(255, 255, 255, 0.5)"
-            style={styles.captionField}
-            value={caption}
-          />
+        <View style={[styles.bottomBarSide, styles.bottomBarSideEnd]}>
           <Pressable
-            accessibilityLabel="Upload post"
+            accessibilityLabel="Start over"
             accessibilityRole="button"
             disabled={isBusy}
-            onPress={() => void uploadPost()}
-            style={({ pressed }) => [styles.captionDone, pressed && styles.pressed, isBusy && styles.disabled]}
+            onPress={() => {
+              setMedia(null);
+              setCaption('');
+              setSound(null);
+              setShowCaptionInput(false);
+            }}
+            style={({ pressed }) => [styles.bottomAction, pressed && styles.pressed, isBusy && styles.disabled]}
           >
-            {isUploading ? (
-              <ActivityIndicator color="#FFFFFF" />
-            ) : (
-              <Text style={styles.captionDoneText}>DONE</Text>
-            )}
+            <Text style={styles.postLabel}>POST</Text>
           </Pressable>
         </View>
-      ) : null}
-
-      <View style={styles.bottomBar}>
-        <Pressable
-          accessibilityLabel="Add a caption and continue"
-          accessibilityRole="button"
-          onPress={() => setShowCaptionInput(true)}
-          style={({ pressed }) => [styles.postButton, pressed && styles.pressed]}
-        >
-          <Text style={styles.postButtonText}>POST</Text>
-        </Pressable>
-
-        <Pressable
-          accessibilityLabel="Start over"
-          accessibilityRole="button"
-          disabled={isBusy}
-          onPress={() => {
-            setMedia(null);
-            setCaption('');
-            setSound(null);
-            setShowCaptionInput(false);
-          }}
-          style={({ pressed }) => [styles.createButton, pressed && styles.pressed, isBusy && styles.disabled]}
-        >
-          <Text style={styles.createButtonText}>CREATE</Text>
-        </Pressable>
       </View>
       </KeyboardAvoidingView>
 
@@ -1105,8 +1052,10 @@ const styles = StyleSheet.create({
     left: 0,
     overflow: 'hidden',
     position: 'absolute',
-    // Stops short of the tool rail, which now occupies 12 to 52 from the right edge.
-    right: 56,
+    // Full width. This used to stop 56 short of the right edge to leave the tool rail its own
+    // column, which is what squashed the viewfinder and left a black strip beside it. The rail
+    // is absolutely positioned and floats over the viewfinder now, so it needs no gutter.
+    right: 0,
     top: 0,
   },
   previewMedia: {
@@ -1188,13 +1137,19 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   toolRail: {
-    // Pinned inside the stage, which ends above the mode row and the shutter row, so the
-    // stack can no longer grow out of it and land on TEXT or on the effects button. The 12
-    // below keeps the last tool off the stage edge and off the row underneath.
+    // Floats over the full width viewfinder rather than sitting beside it, so the camera is not
+    // narrowed to make room. It is a later sibling than the preview and carries a zIndex on top
+    // of that, so it draws over the viewfinder instead of under it.
+    //
+    // Vertically it spans the stage and centres the tools inside it, which is what the earlier
+    // top 80 and bottom 150 broke: those insets are measured against the stage, not the screen,
+    // so they pushed the icons off centre and ate 230px of a rail that only has about 320 to
+    // give on a short phone.
     bottom: 12,
     position: 'absolute',
-    right: 12,
+    right: 10,
     top: 0,
+    zIndex: 10,
   },
   toolRailContent: {
     alignItems: 'center',
@@ -1222,17 +1177,14 @@ const styles = StyleSheet.create({
     fontSize: 9,
     fontWeight: '600',
   },
+  // The five pills share one row, spread across the width rather than separated by a fixed gap
+  // that clipped on a 360dp screen. The pills keep their own size, so the space goes between
+  // them. Selected is the white background with black text; the rest are outlined only.
   modeRow: {
     alignItems: 'center',
-    // In normal flow, directly above the shutter row. The 12 below is the clear gap: the two
-    // rows can never overlap now, whatever height the shutter or the caption bar takes.
     flexDirection: 'row',
-    // Spreads the five pills across the width instead of measuring a fixed gap that clipped
-    // on a 360dp screen. The pills keep their own size, so the space goes between them.
     justifyContent: 'space-between',
-    paddingBottom: 12,
     paddingHorizontal: 15,
-    paddingTop: 10,
     width: '100%',
   },
   modePill: {
@@ -1254,59 +1206,42 @@ const styles = StyleSheet.create({
   modePillTextActive: {
     color: '#000000',
   },
+  // The whole bottom stack in one column. Every row is a flow child and the gap here is the
+  // only thing separating them, which is what guarantees a clear band of space between the
+  // rows instead of two independently positioned ones.
+  bottomCluster: {
+    alignItems: 'center',
+    gap: 14,
+    paddingBottom: 6,
+    width: '100%',
+  },
+  // Thin bar with a white thumb, the way a Xiaomi camera draws it. The 20 matches the padding
+  // on the label row below so the two line up on the same edges.
   zoomRow: {
-    alignItems: 'center',
+    paddingHorizontal: 20,
+    width: '100%',
+  },
+  zoomSlider: {
+    height: 28,
+    width: '100%',
+  },
+  zoomLabels: {
     flexDirection: 'row',
-    gap: 12,
-    justifyContent: 'center',
-    paddingBottom: 10,
-    width: '100%',
+    justifyContent: 'space-between',
+    // Pulls the outer labels in by the width of the thumb, so a label sits under the point its
+    // stop actually puts the thumb rather than under the end of the track.
+    paddingHorizontal: 6,
   },
-  zoomButton: {
-    alignItems: 'center',
-    height: 32,
-    justifyContent: 'center',
-    width: 32,
+  zoomLabelHit: {
+    paddingVertical: 4,
   },
-  zoomTrack: {
-    backgroundColor: 'rgba(255, 255, 255, 0.22)',
-    borderRadius: 999,
-    flex: 1,
-    height: 5,
-    justifyContent: 'center',
-    maxWidth: 190,
-    overflow: 'hidden',
+  zoomLabel: {
+    color: 'rgba(255, 255, 255, 0.6)',
+    fontSize: 11,
+    fontWeight: '700',
   },
-  zoomFill: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 999,
-    height: '100%',
-  },
-  shutterRow: {
-    alignItems: 'center',
-    // space-around rather than space-between: the record button lands in the middle of the
-    // screen with the gallery and effects sitting the same distance out on either side, and
-    // no side padding is needed to keep them off the edges.
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    paddingBottom: 12,
-    paddingTop: 2,
-    width: '100%',
-  },
-  galleryButton: {
-    alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.16)',
-    borderColor: 'rgba(255, 255, 255, 0.5)',
-    borderRadius: 10,
-    borderWidth: 1,
-    height: 46,
-    justifyContent: 'center',
-    overflow: 'hidden',
-    width: 46,
-  },
-  galleryImage: {
-    height: '100%',
-    width: '100%',
+  zoomLabelActive: {
+    color: '#FFFFFF',
   },
   permissionButton: {
     backgroundColor: '#FE2C55',
@@ -1362,42 +1297,6 @@ const styles = StyleSheet.create({
     right: 0,
     top: '66.666%',
   },
-  countdownOverlay: {
-    alignItems: 'center',
-    // alignSelf plus no left or right is what centres an absolutely positioned child in
-    // React Native; pinning both edges with a fixed width would not.
-    alignSelf: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.45)',
-    borderColor: 'rgba(255, 255, 255, 0.35)',
-    borderRadius: 60,
-    borderWidth: 2,
-    height: 120,
-    justifyContent: 'center',
-    position: 'absolute',
-    top: '35%',
-    width: 120,
-  },
-  countdownText: {
-    color: '#FFFFFF',
-    fontSize: 64,
-    fontWeight: '900',
-  },
-  zoomBadge: {
-    backgroundColor: 'rgba(0, 0, 0, 0.6)',
-    borderRadius: 999,
-    // Bottom left rather than the top corner the recording badge uses, so a clip that is
-    // being recorded at a zoom does not show the two on top of each other.
-    bottom: 12,
-    left: 12,
-    paddingHorizontal: 11,
-    paddingVertical: 6,
-    position: 'absolute',
-  },
-  zoomBadgeText: {
-    color: '#FFFFFF',
-    fontSize: 11,
-    fontWeight: '800',
-  },
   recordingBadge: {
     alignItems: 'center',
     backgroundColor: 'rgba(0, 0, 0, 0.6)',
@@ -1421,6 +1320,34 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '700',
   },
+  errorText: {
+    color: '#FF6B6B',
+    fontSize: 12,
+    paddingHorizontal: 15,
+    paddingVertical: 6,
+  },
+  bottomBar: {
+    alignItems: 'center',
+    // Solid black so the bar reads as one block with the viewfinder above it, whatever the
+    // preview is showing. No blur: it costs a native view and reads no better on a dark UI.
+    backgroundColor: '#000000',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingBottom: 18,
+    paddingHorizontal: 20,
+    paddingTop: 10,
+  },
+  // The album and the word are wrapped in two equal flex slots. space-between alone would put
+  // the record circle wherever the two labels happened to end, so it would drift off centre.
+  bottomBarSide: {
+    flex: 1,
+    justifyContent: 'center',
+  },
+  bottomBarSideEnd: {
+    alignItems: 'flex-end',
+  },
+  // TikTok's record button: a white ring around a red disc. The ring is the outer view's
+  // border, so it stays even while the inner disc shrinks to a square while recording.
   shutterOuter: {
     alignItems: 'center',
     borderColor: '#FFFFFF',
@@ -1442,54 +1369,32 @@ const styles = StyleSheet.create({
     height: 36,
     width: 36,
   },
-  errorText: {
-    color: '#FF6B6B',
-    fontSize: 12,
-    paddingHorizontal: 15,
+  // Only the tap target is styled; the word carries the look on its own.
+  bottomAction: {
+    alignItems: 'center',
+    justifyContent: 'center',
     paddingVertical: 6,
   },
-  bottomBar: {
-    // Fixed width buttons rather than flex 1: the pair is a compact centred block instead of
-    // a bar that fills the screen, and both buttons are the same width because the same
-    // value is on each of them.
-    flexDirection: 'row',
-    gap: 15,
-    justifyContent: 'center',
-    paddingBottom: 18,
-    paddingTop: 4,
-  },
-  postButton: {
-    alignItems: 'center',
-    backgroundColor: '#FE2C55',
-    borderRadius: 10,
-    justifyContent: 'center',
-    minHeight: 48,
-    paddingVertical: 12,
-    // Percentage based so the pair keeps its proportions on a narrow phone instead of the
-    // fixed 160 clipping the label on the smallest widths.
-    width: '32%',
-  },
-  postButtonText: {
+  postLabel: {
     color: '#FFFFFF',
     fontSize: 16,
-    fontWeight: '900',
-    letterSpacing: 1.2,
+    fontWeight: 'bold',
+    letterSpacing: 1,
   },
-  createButton: {
+  albumButton: {
     alignItems: 'center',
-    borderColor: 'rgba(255, 255, 255, 0.45)',
-    borderRadius: 10,
+    backgroundColor: 'rgba(255, 255, 255, 0.16)',
+    borderColor: 'rgba(255, 255, 255, 0.5)',
+    borderRadius: 8,
     borderWidth: 1,
+    height: 40,
     justifyContent: 'center',
-    minHeight: 48,
-    paddingVertical: 12,
-    width: '32%',
+    overflow: 'hidden',
+    width: 40,
   },
-  createButtonText: {
-    color: '#FFFFFF',
-    fontSize: 15,
-    fontWeight: '800',
-    letterSpacing: 1.2,
+  albumImage: {
+    height: '100%',
+    width: '100%',
   },
   disabled: {
     opacity: 0.5,

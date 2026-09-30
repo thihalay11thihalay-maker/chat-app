@@ -1,15 +1,7 @@
+import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
+import { useMemo, useState } from 'react';
 import {
-  collection,
-  doc,
-  getDoc,
-  onSnapshot,
-  query,
-  where,
-} from 'firebase/firestore';
-import { useEffect, useState } from 'react';
-import {
-  ActivityIndicator,
   FlatList,
   Image,
   Pressable,
@@ -19,325 +11,223 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
-
-type UnknownRecord = Record<string, unknown>;
-
-type ChatPreview = {
+type InboxChat = {
   id: string;
-  displayName: string;
-  photoUrl: string;
-  lastMessage: string;
-  updatedAt: Date | null;
+  name: string;
+  avatar: string;
+  snippet: string;
+  time: string;
+  unread: number;
+  online: boolean;
+  kind: 'direct' | 'group';
+  age?: number;
+  gender?: 'male' | 'female';
+  distance?: string;
 };
 
-function toDate(value: unknown): Date | null {
-  if (value instanceof Date) {
-    return value;
+type FilterKey = 'All' | 'Friends' | 'Group Chats';
+
+const FILTERS: FilterKey[] = ['All', 'Friends', 'Group Chats'];
+
+// Placeholder rows so the layout can be judged against real content. Avatars are a public
+// placeholder service, not people.
+const MOCK_CHATS: InboxChat[] = [
+  {
+    age: 24,
+    avatar: 'https://i.pravatar.cc/150?img=12',
+    distance: '3 km away',
+    gender: 'female',
+    id: 'mock-1',
+    kind: 'direct',
+    name: 'HninKyaing',
+    online: true,
+    snippet: 'Are you free this evening?',
+    time: '10m ago',
+    unread: 3,
+  },
+  {
+    age: 29,
+    avatar: 'https://i.pravatar.cc/150?img=32',
+    distance: '1.2 km away',
+    gender: 'female',
+    id: 'mock-2',
+    kind: 'direct',
+    name: 'Nwe Lay',
+    online: false,
+    snippet: 'Sent a voice message',
+    time: '19m ago',
+    unread: 0,
+  },
+  {
+    avatar: 'https://i.pravatar.cc/150?img=45',
+    id: 'mock-3',
+    kind: 'group',
+    name: 'Weekend Trip Group',
+    online: true,
+    snippet: 'Mon: does anyone still need a ride?',
+    time: '1h ago',
+    unread: 12,
+  },
+  {
+    age: 31,
+    avatar: 'https://i.pravatar.cc/150?img=5',
+    distance: '8 km away',
+    gender: 'male',
+    id: 'mock-4',
+    kind: 'direct',
+    name: 'Mon',
+    online: true,
+    snippet: 'That sounds good to me 👍',
+    time: '2h ago',
+    unread: 1,
+  },
+  {
+    avatar: 'https://i.pravatar.cc/150?img=20',
+    id: 'mock-5',
+    kind: 'group',
+    name: 'Book Club',
+    online: false,
+    snippet: 'Aye: chapter 4 discussion at 7?',
+    time: 'Yesterday',
+    unread: 0,
+  },
+  {
+    age: 27,
+    avatar: 'https://i.pravatar.cc/150?img=68',
+    distance: '450 m away',
+    gender: 'female',
+    id: 'mock-6',
+    kind: 'direct',
+    name: 'Thiri Aung',
+    online: false,
+    snippet: 'Haha, okay you win',
+    time: 'Yesterday',
+    unread: 0,
+  },
+];
+
+// Filters the same list three ways rather than reaching for three different sources: Friends
+// narrows to the people who are around now, Group Chats to the multi-person threads.
+function filterChats(chats: InboxChat[], filter: FilterKey) {
+  if (filter === 'Friends') {
+    return chats.filter((chat) => chat.kind === 'direct' && chat.online);
   }
-  if (typeof value === 'string' || typeof value === 'number') {
-    const parsed = new Date(value);
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
+
+  if (filter === 'Group Chats') {
+    return chats.filter((chat) => chat.kind === 'group');
   }
-  if (value && typeof value === 'object') {
-    const timestamp = value as { toDate?: () => Date; seconds?: number };
-    if (typeof timestamp.toDate === 'function') {
-      return timestamp.toDate();
-    }
-    if (typeof timestamp.seconds === 'number') {
-      return new Date(timestamp.seconds * 1000);
-    }
-  }
-  return null;
+
+  return chats;
 }
 
-function formatTime(date: Date | null) {
-  if (!date) {
-    return '';
-  }
+function ChatRow({ chat }: { chat: InboxChat }) {
+  const genderIcon = chat.gender === 'female' ? 'female' : 'male';
+  const genderColor = chat.gender === 'female' ? '#F06292' : '#4FA3E3';
 
-  const elapsedMs = Date.now() - date.getTime();
-  if (elapsedMs < 60_000) {
-    return 'now';
-  }
-  if (elapsedMs < 60 * 60_000) {
-    return `${Math.floor(elapsedMs / 60_000)}m`;
-  }
-  if (elapsedMs < 24 * 60 * 60_000) {
-    return `${Math.floor(elapsedMs / (60 * 60_000))}h`;
-  }
-  if (elapsedMs < 7 * 24 * 60 * 60_000) {
-    return `${Math.floor(elapsedMs / (24 * 60 * 60_000))}d`;
-  }
-
-  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-}
-
-function getOtherParticipantId(participants: unknown, currentUserId: string) {
-  if (!Array.isArray(participants)) {
-    return null;
-  }
-
-  const otherParticipant = participants.find((participant) => {
-    if (typeof participant === 'string') {
-      return participant !== currentUserId;
-    }
-    if (participant && typeof participant === 'object' && 'uid' in participant) {
-      return participant.uid !== currentUserId;
-    }
-    return false;
-  });
-
-  if (typeof otherParticipant === 'string') {
-    return otherParticipant;
-  }
-  if (otherParticipant && typeof otherParticipant === 'object' && 'uid' in otherParticipant) {
-    const { uid } = otherParticipant as { uid: unknown };
-    return typeof uid === 'string' ? uid : null;
-  }
-  return null;
-}
-
-function getMessageText(value: unknown) {
-  if (typeof value === 'string' && value.trim()) {
-    return value;
-  }
-  if (value && typeof value === 'object') {
-    const message = value as UnknownRecord;
-    for (const key of ['text', 'content', 'message']) {
-      if (typeof message[key] === 'string' && message[key].trim()) {
-        return message[key];
-      }
-    }
-  }
-  return 'Say hello';
-}
-
-function getProfileText(profile: UnknownRecord, keys: string[], fallback: string) {
-  for (const key of keys) {
-    if (typeof profile[key] === 'string' && profile[key].trim()) {
-      return profile[key];
-    }
-  }
-  return fallback;
-}
-
-function ChatRow({
-  chat,
-  hasPhotoError,
-  onPress,
-  onPhotoError,
-}: {
-  chat: ChatPreview;
-  hasPhotoError: boolean;
-  onPress: () => void;
-  onPhotoError: () => void;
-}) {
   return (
     <Pressable
-      accessibilityLabel={`Chat with ${chat.displayName}`}
+      accessibilityLabel={`Chat with ${chat.name}${chat.unread > 0 ? `, ${chat.unread} unread` : ''}`}
       accessibilityRole="button"
-      onPress={onPress}
-      style={({ pressed }) => [styles.chatRow, pressed && styles.chatRowPressed]}
+      // The mock rows have no chat document behind them, so this only opens a thread once the
+      // list is wired back to real ids.
+      onPress={() => router.push('/friends' as never)}
+      style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
     >
       <View style={styles.avatarWrap}>
-        {chat.photoUrl && !hasPhotoError ? (
-          <Image onError={onPhotoError} source={{ uri: chat.photoUrl }} style={styles.avatarImage} />
-        ) : (
-          <View style={styles.avatarFallback}>
-            <Text style={styles.avatarFallbackText}>{chat.displayName.charAt(0).toUpperCase()}</Text>
+        <Image source={{ uri: chat.avatar }} style={styles.avatar} />
+
+        {chat.unread > 0 ? (
+          <View style={styles.unreadBadge}>
+            <Text style={styles.unreadBadgeText}>{chat.unread > 99 ? '99+' : chat.unread}</Text>
           </View>
-        )}
+        ) : null}
       </View>
 
-      <View style={styles.chatCopy}>
+      <View style={styles.middle}>
         <View style={styles.nameLine}>
-          <Text numberOfLines={1} style={styles.chatName}>{chat.displayName}</Text>
-          <Text style={styles.timeText}>{formatTime(chat.updatedAt)}</Text>
+          <Text numberOfLines={1} style={styles.name}>{chat.name}</Text>
+
+          {chat.gender ? (
+            <View style={styles.metaChip}>
+              <Ionicons color={genderColor} name={genderIcon} size={11} />
+              {chat.age ? <Text style={styles.metaText}>{chat.age}</Text> : null}
+            </View>
+          ) : null}
+
+          {chat.distance ? <Text style={styles.distanceText}>{chat.distance}</Text> : null}
         </View>
-        <Text numberOfLines={1} style={styles.messageText}>{chat.lastMessage}</Text>
+
+        <View style={styles.snippetLine}>
+          {chat.online ? <View style={styles.onlineDot} /> : null}
+          <Text numberOfLines={1} style={styles.snippet}>{chat.snippet}</Text>
+        </View>
       </View>
+
+      <Text style={styles.time}>{chat.time}</Text>
     </Pressable>
   );
 }
 
-function EmptyChats() {
-  return (
-    <View style={styles.emptyState}>
-      <View style={styles.emptyMark}>
-        <Text style={styles.emptyMarkText}>...</Text>
-      </View>
-      <Text style={styles.emptyTitle}>No chats yet</Text>
-      <Text style={styles.emptyText}>No chats yet. Find friends to start chatting!</Text>
-      <Pressable
-        accessibilityRole="button"
-        onPress={() => router.push('/friends' as never)}
-        style={({ pressed }) => [styles.emptyButton, pressed && styles.pressed]}
-      >
-        <Text style={styles.emptyButtonText}>Find friends</Text>
-      </Pressable>
-    </View>
-  );
-}
-
 export default function ChatListScreen() {
-  const currentUser = getFirebaseAuth().currentUser;
-  const [chats, setChats] = useState<ChatPreview[]>([]);
-  const [isLoading, setIsLoading] = useState(Boolean(currentUser));
-  const [errorMessage, setErrorMessage] = useState(currentUser ? '' : 'Please log in to see your chats.');
-  const [photoErrors, setPhotoErrors] = useState<string[]>([]);
+  const [filter, setFilter] = useState<FilterKey>('All');
 
-  useEffect(() => {
-    let isActive = true;
-    let updateNumber = 0;
-
-    if (!currentUser) {
-      return () => {
-        isActive = false;
-      };
-    }
-
-    const chatsQuery = query(
-      collection(getFirebaseDb(), 'chats'),
-      where('participants', 'array-contains', currentUser.uid),
-    );
-
-    const unsubscribe = onSnapshot(chatsQuery, (snapshot) => {
-      const thisUpdate = ++updateNumber;
-
-      // The other participant is fetched per chat, so the snapshots are only applied
-      // once the newest one has resolved. Otherwise a slow profile read can overwrite
-      // fresher data.
-      const loadChatPreviews = async () => {
-        const nextChats = await Promise.all(snapshot.docs.map(async (chatDocument) => {
-          const chatData = chatDocument.data() as UnknownRecord;
-          const otherUid = getOtherParticipantId(chatData.participants, currentUser.uid);
-          const embeddedProfiles = chatData.participantProfiles as UnknownRecord | undefined;
-          const embeddedProfile = embeddedProfiles && otherUid
-            ? embeddedProfiles[otherUid] as UnknownRecord | undefined
-            : undefined;
-          let profile = embeddedProfile ?? {};
-
-          if (otherUid) {
-            try {
-              const profileSnapshot = await getDoc(doc(getFirebaseDb(), 'users', otherUid));
-              if (profileSnapshot.exists()) {
-                profile = { ...profile, ...profileSnapshot.data() };
-              }
-            } catch (error) {
-              console.warn(`Could not load chat profile ${otherUid}:`, error);
-            }
-          }
-
-          const lastMessage = chatData.lastMessage;
-          const lastMessageData = lastMessage && typeof lastMessage === 'object'
-            ? lastMessage as UnknownRecord
-            : undefined;
-          const updatedAt = toDate(chatData.lastMessageAt)
-            ?? toDate(lastMessageData?.createdAt)
-            ?? toDate(lastMessageData?.timestamp)
-            ?? toDate(chatData.updatedAt)
-            ?? toDate(chatData.createdAt);
-
-          return {
-            displayName: getProfileText(profile, ['displayName', 'name', 'username'], 'New friend'),
-            id: chatDocument.id,
-            lastMessage: lastMessage
-              ? getMessageText(lastMessage)
-              : getMessageText(chatData.lastMessageText),
-            photoUrl: getProfileText(profile, ['profilePictureUrl', 'photoURL', 'photoUrl', 'avatarUrl'], ''),
-            updatedAt,
-          } satisfies ChatPreview;
-        }));
-
-        if (isActive && thisUpdate === updateNumber) {
-          nextChats.sort((first, second) => (second.updatedAt?.getTime() ?? 0) - (first.updatedAt?.getTime() ?? 0));
-          setChats(nextChats);
-          setPhotoErrors([]);
-          setErrorMessage('');
-          setIsLoading(false);
-        }
-      };
-
-      void loadChatPreviews().catch((error: unknown) => {
-        console.error('Could not load chat previews:', error);
-        if (isActive && thisUpdate === updateNumber) {
-          setErrorMessage('Could not load your chats. Please try again.');
-          setIsLoading(false);
-        }
-      });
-    }, (error) => {
-      console.error('Chat listener failed:', error);
-      if (isActive) {
-        setErrorMessage('Could not load your chats. Check your connection and try again.');
-        setIsLoading(false);
-      }
-    });
-
-    return () => {
-      isActive = false;
-      unsubscribe();
-    };
-  }, [currentUser]);
-
-  const openChat = (chatId: string) => {
-    router.push(`/chat/${chatId}` as never);
-  };
-
-  const markPhotoFailed = (chatId: string) => {
-    setPhotoErrors((current) => (current.includes(chatId) ? current : [...current, chatId]));
-  };
+  const visibleChats = useMemo(() => filterChats(MOCK_CHATS, filter), [filter]);
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <View style={styles.screen}>
-        <View style={styles.header}>
-          <View>
-            <Text style={styles.eyebrow}>CONVO</Text>
-            <Text style={styles.title}>Messages</Text>
-          </View>
-          <View style={styles.headerAvatar}>
-            <Text style={styles.headerAvatarText}>
-              {currentUser?.displayName?.trim().charAt(0).toUpperCase() || 'C'}
-            </Text>
-          </View>
+      {/* Three equal slots rather than space-between: the title has to sit in the middle of the
+          bar, and the left label is much wider than the icon on the right. */}
+      <View style={styles.header}>
+        <View style={styles.headerSide}>
+          <Pressable
+            accessibilityLabel="Find friends"
+            accessibilityRole="button"
+            onPress={() => router.push('/friends' as never)}
+            style={({ pressed }) => [styles.findFriendsHit, pressed && styles.rowPressed]}
+          >
+            <Text style={styles.findFriends}>Find Friends</Text>
+          </Pressable>
         </View>
 
-        {isLoading ? (
-          <View style={styles.stateContainer}>
-            <ActivityIndicator color="#E56B4C" size="large" />
-            <Text style={styles.stateText}>Loading your chats...</Text>
-          </View>
-        ) : errorMessage ? (
-          <View style={styles.stateContainer}>
-            <Text style={styles.stateTitle}>Chats unavailable</Text>
-            <Text style={styles.stateText}>{errorMessage}</Text>
-          </View>
-        ) : (
-          <FlatList
-            contentContainerStyle={styles.chatList}
-            data={chats}
-            initialNumToRender={10}
-            keyExtractor={(item) => item.id}
-            ListEmptyComponent={EmptyChats}
-            ListHeaderComponent={chats.length > 0 ? (
-              <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Recent chats</Text>
-                <Text style={styles.chatCount}>{chats.length}</Text>
-              </View>
-            ) : null}
-            renderItem={({ item }) => (
-              <ChatRow
-                chat={item}
-                hasPhotoError={photoErrors.includes(item.id)}
-                onPhotoError={() => markPhotoFailed(item.id)}
-                onPress={() => openChat(item.id)}
-              />
-            )}
-            showsVerticalScrollIndicator={false}
-          />
-        )}
+        <Text style={styles.headerTitle}>Messages</Text>
+
+        <View style={[styles.headerSide, styles.headerSideEnd]}>
+          <Pressable
+            accessibilityLabel="Menu"
+            accessibilityRole="button"
+            style={({ pressed }) => [styles.menuHit, pressed && styles.rowPressed]}
+          >
+            <Ionicons color="#20232A" name="menu-outline" size={24} />
+          </Pressable>
+        </View>
       </View>
+
+      <View style={styles.filterBar}>
+        {FILTERS.map((option) => {
+          const isActive = option === filter;
+
+          return (
+            <Pressable
+              key={option}
+              accessibilityLabel={`${option} chats`}
+              accessibilityRole="button"
+              onPress={() => setFilter(option)}
+              style={[styles.filterTab, isActive && styles.filterTabActive]}
+            >
+              <Text style={[styles.filterText, isActive && styles.filterTextActive]}>{option}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      <FlatList
+        contentContainerStyle={styles.list}
+        data={visibleChats}
+        initialNumToRender={8}
+        keyExtractor={(item) => item.id}
+        renderItem={({ item }) => <ChatRow chat={item} />}
+        showsVerticalScrollIndicator={false}
+      />
     </SafeAreaView>
   );
 }
@@ -347,193 +237,163 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7F4EF',
     flex: 1,
   },
-  screen: {
-    flex: 1,
-    paddingHorizontal: 22,
-    paddingTop: 18,
-  },
   header: {
     alignItems: 'center',
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 24,
+    paddingHorizontal: 16,
+    paddingTop: 10,
   },
-  eyebrow: {
-    color: '#E56B4C',
-    fontSize: 11,
-    fontWeight: '800',
-    letterSpacing: 1.8,
-    marginBottom: 5,
-  },
-  title: {
-    color: '#20232A',
-    fontSize: 32,
-    fontWeight: '800',
-  },
-  headerAvatar: {
-    alignItems: 'center',
-    backgroundColor: '#D7E6DF',
-    borderRadius: 23,
-    height: 46,
-    justifyContent: 'center',
-    width: 46,
-  },
-  headerAvatarText: {
-    color: '#315A49',
-    fontSize: 17,
-    fontWeight: '800',
-  },
-  sectionHeader: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 9,
-    marginBottom: 12,
-  },
-  sectionTitle: {
-    color: '#363A42',
-    fontSize: 15,
-    fontWeight: '800',
-  },
-  chatCount: {
-    backgroundColor: '#E7E2DA',
-    borderRadius: 10,
-    color: '#656A73',
-    fontSize: 11,
-    fontWeight: '800',
-    overflow: 'hidden',
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-  },
-  chatList: {
-    flexGrow: 1,
-    paddingBottom: 120,
-  },
-  chatRow: {
-    alignItems: 'center',
-    borderBottomColor: '#E7E2DA',
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    flexDirection: 'row',
-    minHeight: 82,
-    paddingVertical: 13,
-  },
-  chatRowPressed: {
-    opacity: 0.72,
-  },
-  avatarWrap: {
-    height: 54,
-    marginRight: 14,
-    width: 54,
-  },
-  avatarImage: {
-    backgroundColor: '#E7E2DA',
-    borderRadius: 27,
-    height: 54,
-    width: 54,
-  },
-  avatarFallback: {
-    alignItems: 'center',
-    backgroundColor: '#F2C6B8',
-    borderRadius: 27,
+  headerSide: {
     flex: 1,
     justifyContent: 'center',
   },
-  avatarFallbackText: {
-    color: '#6E3D31',
+  headerSideEnd: {
+    alignItems: 'flex-end',
+  },
+  findFriendsHit: {
+    paddingVertical: 4,
+  },
+  findFriends: {
+    color: '#8D929C',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  headerTitle: {
+    color: '#20232A',
     fontSize: 19,
     fontWeight: '800',
   },
-  chatCopy: {
+  menuHit: {
+    padding: 4,
+  },
+  filterBar: {
+    borderBottomColor: '#E3DED5',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    marginTop: 12,
+    paddingHorizontal: 16,
+  },
+  filterTab: {
+    borderRadius: 999,
+    marginBottom: 10,
+    marginRight: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+  },
+  filterTabActive: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#E3DED5',
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  filterText: {
+    color: '#8D929C',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  filterTextActive: {
+    color: '#20232A',
+    fontWeight: '800',
+  },
+  list: {
+    // Clears the custom tab bar, which floats over the bottom of the screen.
+    paddingBottom: 120,
+  },
+  row: {
+    // Top aligned so the timestamp sits on the first line with the name rather than centred
+    // against a two-line block.
+    alignItems: 'flex-start',
+    borderBottomColor: '#E7E2DA',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  rowPressed: {
+    opacity: 0.7,
+  },
+  avatarWrap: {
+    height: 54,
+    marginRight: 12,
+    width: 54,
+  },
+  avatar: {
+    backgroundColor: '#E7E2DA',
+    borderRadius: 27,
+    height: 54,
+    width: 54,
+  },
+  unreadBadge: {
+    alignItems: 'center',
+    backgroundColor: '#FE2C55',
+    borderColor: '#F7F4EF',
+    borderRadius: 10,
+    borderWidth: 2,
+    height: 20,
+    justifyContent: 'center',
+    minWidth: 20,
+    paddingHorizontal: 4,
+    // Pulled onto the corner of the circle, which is why the wrapper is not overflow hidden.
+    position: 'absolute',
+    right: -6,
+    top: -4,
+  },
+  unreadBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  middle: {
     flex: 1,
+    justifyContent: 'center',
     minWidth: 0,
   },
   nameLine: {
     alignItems: 'center',
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 7,
+    gap: 6,
+    marginBottom: 4,
   },
-  chatName: {
+  name: {
     color: '#20232A',
-    flex: 1,
-    fontSize: 16,
+    flexShrink: 1,
+    fontSize: 15,
     fontWeight: '800',
-    marginRight: 10,
   },
-  timeText: {
-    color: '#8D929C',
+  metaChip: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 2,
+  },
+  metaText: {
+    color: '#656A73',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  distanceText: {
+    color: '#A2A7B0',
     fontSize: 11,
     fontWeight: '600',
   },
-  messageText: {
+  snippetLine: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 6,
+  },
+  onlineDot: {
+    backgroundColor: '#2FBF71',
+    borderRadius: 3,
+    height: 6,
+    width: 6,
+  },
+  snippet: {
     color: '#656A73',
+    flexShrink: 1,
     fontSize: 13,
-    lineHeight: 19,
   },
-  stateContainer: {
-    alignItems: 'center',
-    flex: 1,
-    justifyContent: 'center',
-    paddingHorizontal: 30,
-  },
-  stateTitle: {
-    color: '#20232A',
-    fontSize: 19,
-    fontWeight: '800',
-    marginBottom: 5,
-  },
-  stateText: {
-    color: '#777C84',
-    fontSize: 14,
-    lineHeight: 21,
-    marginTop: 12,
-    textAlign: 'center',
-  },
-  emptyState: {
-    alignItems: 'center',
-    flex: 1,
-    justifyContent: 'center',
-    paddingBottom: 60,
-    paddingHorizontal: 24,
-  },
-  emptyMark: {
-    alignItems: 'center',
-    backgroundColor: '#F1DDD5',
-    borderRadius: 34,
-    height: 68,
-    justifyContent: 'center',
-    marginBottom: 20,
-    width: 68,
-  },
-  emptyMarkText: {
-    color: '#E56B4C',
-    fontSize: 22,
-    fontWeight: '800',
-  },
-  emptyTitle: {
-    color: '#20232A',
-    fontSize: 21,
-    fontWeight: '800',
-    marginBottom: 7,
-  },
-  emptyText: {
-    color: '#777C84',
-    fontSize: 14,
-    lineHeight: 21,
-    textAlign: 'center',
-  },
-  emptyButton: {
-    backgroundColor: '#20232A',
-    borderRadius: 10,
-    marginTop: 20,
-    paddingHorizontal: 19,
-    paddingVertical: 12,
-  },
-  emptyButtonText: {
-    color: '#FFFFFF',
-    fontSize: 13,
-    fontWeight: '800',
-  },
-  pressed: {
-    opacity: 0.78,
+  time: {
+    color: '#A2A7B0',
+    fontSize: 11,
+    fontWeight: '600',
+    marginLeft: 8,
   },
 });

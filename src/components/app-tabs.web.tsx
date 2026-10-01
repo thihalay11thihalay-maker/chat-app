@@ -24,9 +24,8 @@ export default function AppTabs() {
           <TabTrigger name="home" href="/" asChild>
             <TabButton>Home</TabButton>
           </TabTrigger>
-          <TabTrigger name="explore" href="/explore" asChild>
-            <TabButton>Explore</TabButton>
-          </TabTrigger>
+          {/* The starter's Explore route is gone: Explore is a tab inside the Home feed now,
+              not a screen of its own, so it has no href to point at. */}
         </CustomTabList>
       </TabList>
     </Tabs>

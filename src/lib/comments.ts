@@ -27,6 +27,9 @@ export interface PostComment {
   createdAt: Date | null;
   displayName: string;
   id: string;
+  // Null on a top level comment. A reply carries the id of the comment it hangs under, which
+  // is what the sheet groups on.
+  parentId: string | null;
   replyToName?: string;
   text: string;
   userId: string;
@@ -37,11 +40,15 @@ function toComment(id: string, data: Record<string, unknown>): PostComment {
     ? data.createdAt
     : data.createdAt instanceof Timestamp ? data.createdAt.toDate() : null;
   const replyToName = data.replyToName;
+  const parentId = data.parentId;
 
   return {
     createdAt,
     displayName: typeof data.displayName === 'string' && data.displayName ? data.displayName : 'User',
     id,
+    // Comments written before replies existed have no parentId field at all, and Firestore
+    // cannot store undefined, so anything that is not a non-empty string reads as null.
+    parentId: typeof parentId === 'string' && parentId ? parentId : null,
     replyToName: typeof replyToName === 'string' && replyToName ? replyToName : undefined,
     text: typeof data.text === 'string' ? data.text : '',
     userId: typeof data.userId === 'string' ? data.userId : '',
@@ -72,6 +79,8 @@ export function listenToComments(
 
 export interface NewComment {
   displayName: string;
+  // Null for a top level comment. A reply carries the id of the comment it hangs under.
+  parentId?: string | null;
   replyToName?: string;
   text: string;
   userId: string;
@@ -95,6 +104,9 @@ export async function addComment(postId: string, comment: NewComment) {
     transaction.set(commentRef, {
       createdAt: serverTimestamp(),
       displayName: comment.displayName,
+      // Written as null rather than left out, so the two cases can be told apart by asking
+      // whether the field is null instead of by checking whether it happens to exist.
+      parentId: comment.parentId ?? null,
       replyToName: comment.replyToName ?? null,
       text: comment.text,
       userId: comment.userId,
@@ -104,18 +116,31 @@ export async function addComment(postId: string, comment: NewComment) {
   });
 }
 
-export async function deleteComment(postId: string, commentId: string) {
+/**
+ * Removes a comment and the replies hanging off it.
+ *
+ * The replies are passed in rather than looked up here: a transaction cannot read a query, and
+ * the caller already has the whole thread on screen. A reply that arrives between that read and
+ * this write is not deleted, but it keeps its parentId, and the sheet promotes a reply whose
+ * parent is missing to the top level, so it stays visible instead of being lost.
+ */
+export async function deleteComment(postId: string, commentId: string, replyIds: string[] = []) {
   const db = getFirebaseDb();
   const postRef = doc(db, 'posts', postId);
+  const commentsRef = collection(postRef, COMMENTS_COLLECTION);
 
   await runTransaction(db, async (transaction) => {
     const post = await transaction.get(postRef);
     const stored = post.exists() ? post.data().commentsCount : undefined;
     const count = typeof stored === 'number' && Number.isFinite(stored) ? stored : 0;
 
-    transaction.delete(doc(collection(postRef, COMMENTS_COLLECTION), commentId));
-    // Never below zero: a post whose counter drifted can come back up to a real number.
-    transaction.update(postRef, { commentsCount: Math.max(0, count - 1) });
+    for (const replyId of replyIds) {
+      transaction.delete(doc(commentsRef, replyId));
+    }
+
+    transaction.delete(doc(commentsRef, commentId));
+    // Every document removed, not just the one tapped, so the counter keeps matching the list.
+    transaction.update(postRef, { commentsCount: Math.max(0, count - 1 - replyIds.length) });
   });
 }
 

@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -27,6 +27,15 @@ import {
 } from '@/lib/comments';
 import { getFirebaseAuth, getFirebaseDb, isFirestorePermissionError } from '@/lib/firebase';
 import { getString } from '@/lib/user-data';
+
+// The four reactions offered on a comment. An emoji glyph rather than an icon font entry:
+// these are the platform's own, so they render in colour on both platforms with no asset.
+const REACTION_EMOJI = [
+  { emoji: '❤️', label: 'Love' },
+  { emoji: '👍', label: 'Like' },
+  { emoji: '😡', label: 'Angry' },
+  { emoji: '😄', label: 'Smile' },
+];
 
 interface CommentSheetProps {
   onClose: () => void;
@@ -92,7 +101,15 @@ function CommentSheetModal({
   const [viewer, setViewer] = useState<User | null>(null);
   const [comments, setComments] = useState<PostComment[]>([]);
   const [draft, setDraft] = useState('');
-  const [replyToName, setReplyToName] = useState<string | null>(null);
+  // Which comment is being answered. The id becomes the new comment's parentId; the name is
+  // only there so the banner and the @mention can label the target.
+  const [replyingTo, setReplyingTo] = useState<{ id: string; name: string } | null>(null);
+  const replyToName = replyingTo?.name ?? null;
+  // Reactions are local for now: a reaction disappears when the sheet closes and is never
+  // written to Firestore. Keyed by comment id, so it survives the list recycling a row.
+  const [reactions, setReactions] = useState<Record<string, string>>({});
+  // Which comment has its emoji row open. One at a time, so two rows are never open at once.
+  const [emojiPickerFor, setEmojiPickerFor] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSending, setIsSending] = useState(false);
   const [isDenied, setIsDenied] = useState(false);
@@ -137,18 +154,51 @@ function CommentSheetModal({
     },
   ), [postId]);
 
+  // A reply always hangs under a top level comment, never under another reply. Answering a
+  // reply therefore points at the same parent as the reply itself, which keeps the thread one
+  // level deep instead of growing an unbounded chain the sheet has no way to indent.
+  const parentIdFor = useCallback((comment: PostComment) => (
+    comment.parentId ?? comment.id
+  ), []);
+
   const startReply = useCallback((comment: PostComment) => {
-    setReplyToName(comment.displayName);
+    setReplyingTo({ id: parentIdFor(comment), name: comment.displayName });
+    // The mention is dropped into the draft as well as shown on the banner, so it is visible
+    // where the text is being typed. send() takes it back off again, because the reply target
+    // is stored on its own field and the row renders it.
+    setDraft(`@${comment.displayName} `);
     // The keyboard opens straight away, so a reply is one tap from being typed.
     inputRef.current?.focus();
-  }, []);
+  }, [parentIdFor]);
 
   const cancelReply = useCallback(() => {
-    setReplyToName(null);
+    setReplyingTo(null);
+
+    // Takes the mention back out of whatever has been typed since, and leaves the rest alone.
+    setDraft((current) => (
+      replyToName && current.startsWith(`@${replyToName} `)
+        ? current.slice(`@${replyToName} `.length)
+        : current
+    ));
+  }, [replyToName]);
+
+  const toggleEmojiPicker = useCallback((commentId: string) => {
+    setEmojiPickerFor((current) => (current === commentId ? null : commentId));
+  }, []);
+
+  const chooseReaction = useCallback((commentId: string, emoji: string) => {
+    setReactions((current) => ({ ...current, [commentId]: emoji }));
+    setEmojiPickerFor(null);
   }, []);
 
   const send = useCallback(async () => {
-    const text = draft.trim();
+    const typed = draft.trim();
+    // The mention the reply flow put in the draft is not part of the message: it is stored on
+    // replyToName and rendered from there, so leaving it in would print it twice.
+    const mentionPrefix = replyToName ? `@${replyToName} ` : '';
+    const text = replyToName && typed.startsWith(mentionPrefix)
+      ? typed.slice(mentionPrefix.length).trim()
+      : typed;
 
     if (!text || !viewer || isSending) {
       return;
@@ -163,6 +213,9 @@ function CommentSheetModal({
 
       await addComment(postId, {
         displayName,
+        // null rather than undefined for a top level comment, so the two cases are told apart
+        // by the value instead of by the field being missing.
+        parentId: replyingTo?.id ?? null,
         replyToName: replyToName ?? undefined,
         text,
         userId: viewer.uid,
@@ -171,7 +224,7 @@ function CommentSheetModal({
       // The counter on the post document is written in the same transaction, so the count
       // next to the comment icon follows on its own through the feed listener.
       setDraft('');
-      setReplyToName(null);
+      setReplyingTo(null);
       // Newest first, so the comment just sent is already the top row; scrolling is only
       // needed when the list was not at the top yet.
       listRef.current?.scrollToOffset({ animated: true, offset: 0 });
@@ -190,15 +243,52 @@ function CommentSheetModal({
     } finally {
       setIsSending(false);
     }
-  }, [draft, isSending, postId, replyToName, viewer]);
+  }, [draft, isSending, postId, replyingTo, replyToName, viewer]);
 
-  const remove = useCallback(async (comment: PostComment) => {
+  // Split once per change rather than filtering inside every row: the list holds top level
+// comments, and each one looks up its own replies in the map. Declared above the handlers
+// because deleting a comment needs to know which replies go with it.
+const { mainComments, repliesByParent } = useMemo(() => {
+  const mainIds = new Set(
+    comments.filter((comment) => !comment.parentId).map((comment) => comment.id),
+  );
+  const byParent = new Map<string, PostComment[]>();
+
+  for (const comment of comments) {
+    if (!comment.parentId) {
+      continue;
+    }
+
+    // A reply whose parent is missing would have nowhere to render, so it is left out of the
+    // map here and promoted to the top level below rather than disappearing from the sheet.
+    if (!mainIds.has(comment.parentId)) {
+      continue;
+    }
+
+    const existing = byParent.get(comment.parentId);
+    if (existing) {
+      existing.push(comment);
+    } else {
+      byParent.set(comment.parentId, [comment]);
+    }
+  }
+
+  return {
+    mainComments: comments.filter((comment) => !comment.parentId || !mainIds.has(comment.parentId)),
+    repliesByParent: byParent,
+  };
+}, [comments]);
+
+const remove = useCallback(async (comment: PostComment) => {
     if (comment.userId !== viewer?.uid) {
       return;
     }
 
     try {
-      await deleteComment(postId, comment.id);
+      // The replies come with it: they only render under this comment, so leaving them behind
+      // would make them unreachable while still counting towards the post total.
+      const replyIds = (repliesByParent.get(comment.id) ?? []).map((reply) => reply.id);
+      await deleteComment(postId, comment.id, replyIds);
     } catch (error) {
       if (isFirestorePermissionError(error)) {
         Alert.alert(
@@ -211,10 +301,12 @@ function CommentSheetModal({
       console.error('Could not delete the comment:', error);
       Alert.alert('Could not delete', 'Please try again in a moment.');
     }
-  }, [postId, viewer?.uid]);
+  }, [postId, repliesByParent, viewer?.uid]);
 
-  const renderComment = useCallback(({ item }: { item: PostComment }) => (
-    <View style={styles.row}>
+  // One comment's body: avatar, name, text, and the actions. A reply renders through this too,
+  // so Delete, Reply and the emoji picker work identically at either level.
+  const renderCommentBody = useCallback((item: PostComment) => (
+    <>
       <View style={styles.avatar}>
         <Text style={styles.avatarLetter}>{item.displayName.charAt(0).toUpperCase()}</Text>
       </View>
@@ -233,6 +325,9 @@ function CommentSheetModal({
 
         <View style={styles.rowMeta}>
           <Text style={styles.rowTime}>{formatCommentTime(item.createdAt)}</Text>
+
+          {/* Delete only appears on your own comments. Reply is always there, including on
+              your own, because replying to yourself is how people thread a conversation. */}
           {item.userId === viewer?.uid ? (
             <Pressable
               accessibilityLabel="Delete comment"
@@ -242,20 +337,81 @@ function CommentSheetModal({
             >
               <Text style={styles.rowActionText}>Delete</Text>
             </Pressable>
-          ) : (
-            <Pressable
-              accessibilityLabel={`Reply to ${item.displayName}`}
-              accessibilityRole="button"
-              onPress={() => startReply(item)}
-              style={styles.rowAction}
-            >
-              <Text style={styles.rowActionText}>Reply</Text>
-            </Pressable>
-          )}
+          ) : null}
+
+          <Pressable
+            accessibilityLabel={`Reply to ${item.displayName}`}
+            accessibilityRole="button"
+            onPress={() => startReply(item)}
+            style={styles.rowAction}
+          >
+            <Text style={styles.rowActionText}>Reply</Text>
+          </Pressable>
+
+          {reactions[item.id] ? (
+            <Text style={styles.reactionChip}>{reactions[item.id]}</Text>
+          ) : null}
+
+          <Pressable
+            accessibilityLabel={`React to ${item.displayName}'s comment`}
+            accessibilityRole="button"
+            hitSlop={8}
+            onPress={() => toggleEmojiPicker(item.id)}
+            style={styles.rowAction}
+          >
+            <Ionicons
+              color={emojiPickerFor === item.id ? '#FFFFFF' : '#9CA3AF'}
+              name="happy-outline"
+              size={16}
+            />
+          </Pressable>
         </View>
+
+        {emojiPickerFor === item.id ? (
+          <View style={styles.emojiPicker}>
+            {REACTION_EMOJI.map((option) => (
+              <Pressable
+                accessibilityLabel={`React ${option.label}`}
+                accessibilityRole="button"
+                key={option.emoji}
+                onPress={() => chooseReaction(item.id, option.emoji)}
+                style={({ pressed }) => [styles.emojiOption, pressed && styles.emojiOptionPressed]}
+              >
+                <Text style={styles.emojiOptionText}>{option.emoji}</Text>
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
       </View>
-    </View>
-  ), [remove, startReply, viewer?.uid]);
+    </>
+  ), [chooseReaction, emojiPickerFor, reactions, remove, startReply, toggleEmojiPicker, viewer?.uid]);
+
+  // The list holds top level comments only. Replies are grouped underneath their parent inside
+  // the same row, so the sheet scrolls as one thread rather than interleaving the two.
+  const renderComment = useCallback(({ item }: { item: PostComment }) => {
+    const nestedReplies = repliesByParent.get(item.id) ?? [];
+
+    return (
+      <View style={styles.thread}>
+        <View style={styles.row}>{renderCommentBody(item)}</View>
+
+        {nestedReplies.length > 0 ? (
+          <View style={styles.replies}>
+            {/* The line the replies hang off, inset to sit under the parent's text. */}
+            <View style={styles.replyLine} />
+
+            <View style={styles.repliesBody}>
+              {nestedReplies.map((reply) => (
+                <View key={reply.id} style={styles.row}>
+                  {renderCommentBody(reply)}
+                </View>
+              ))}
+            </View>
+          </View>
+        ) : null}
+      </View>
+    );
+  }, [renderCommentBody, repliesByParent]);
 
   return (
     <Modal
@@ -305,14 +461,18 @@ function CommentSheetModal({
               <View style={styles.notice}>
                 <ActivityIndicator color="#FFFFFF" />
               </View>
-            ) : comments.length === 0 ? (
+            ) : mainComments.length === 0 ? (
               <View style={styles.notice}>
                 <Text style={styles.noticeText}>No comments yet. Be the first.</Text>
               </View>
             ) : (
               <FlatList
                 contentContainerStyle={styles.listContent}
-                data={comments}
+                // Top level comments only; each row draws its own replies underneath itself.
+                data={mainComments}
+                // A comment's reaction is local state, not part of the comment, so the rows do
+                // not re-render when it changes. extraData is what tells the list to redraw them.
+                extraData={[reactions, emojiPickerFor]}
                 keyboardShouldPersistTaps="handled"
                 keyExtractor={(item) => item.id}
                 ListFooterComponent={<View style={styles.listFooter} />}
@@ -407,7 +567,24 @@ const styles = StyleSheet.create({
   noticeText: { color: '#9CA3AF', fontSize: 13, textAlign: 'center' },
   listContent: { paddingHorizontal: 16, paddingTop: 12 },
   listFooter: { height: 8 },
-  row: { flexDirection: 'row', gap: 10, marginBottom: 14 },
+  row: { flexDirection: 'row', gap: 10 },
+  // Wraps one comment and the replies hanging off it, so the two are one block in the list
+  // and the gap below the thread is bigger than the gap between replies.
+  thread: { marginBottom: 14 },
+  replies: {
+    flexDirection: 'row',
+    // Indents the replies under the parent's text rather than its avatar, which is what makes
+    // them read as belonging to the comment above.
+    marginLeft: 42,
+    marginTop: 8,
+  },
+  // The vertical rule connecting the replies to their parent.
+  replyLine: {
+    backgroundColor: '#374151',
+    marginRight: 10,
+    width: 2,
+  },
+  repliesBody: { flex: 1, gap: 10, minWidth: 0 },
   avatar: {
     alignItems: 'center',
     backgroundColor: '#1E3A8A',
@@ -425,6 +602,22 @@ const styles = StyleSheet.create({
   rowTime: { color: '#6B7280', fontSize: 12 },
   rowAction: { paddingVertical: 2 },
   rowActionText: { color: '#9CA3AF', fontSize: 12, fontWeight: '700' },
+  // The picked emoji sits in the meta row rather than replacing the smiley, so the reaction can
+  // be changed without opening the picker again.
+  reactionChip: { fontSize: 14 },
+  emojiPicker: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#1F2937',
+    borderRadius: 999,
+    flexDirection: 'row',
+    gap: 2,
+    marginTop: 8,
+    paddingHorizontal: 6,
+    paddingVertical: 5,
+  },
+  emojiOption: { borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2 },
+  emojiOptionPressed: { backgroundColor: '#374151' },
+  emojiOptionText: { fontSize: 20 },
   composer: {
     backgroundColor: '#0B1220',
     borderTopColor: '#1F2937',

@@ -39,7 +39,7 @@ export type TabItem = {
 
 export const TAB_ITEMS: TabItem[] = [
   { key: 'home', label: 'Home', href: '/home', icon: 'home-outline', activeIcon: 'home' },
-  { key: 'friends', label: 'Friends', href: '/friends', icon: 'people-outline', activeIcon: 'people' },
+  { key: 'live', label: 'Live', href: '/live', icon: 'radio-outline', activeIcon: 'radio' },
   { key: 'upload', label: 'Upload', href: '/upload', icon: 'add', activeIcon: 'add' },
   { key: 'inbox', label: 'Inbox', href: '/chat', icon: 'chatbubble-ellipses-outline', activeIcon: 'chatbubble-ellipses' },
   { key: 'profile', label: 'Profile', href: '/profile', icon: 'person-outline', activeIcon: 'person' },

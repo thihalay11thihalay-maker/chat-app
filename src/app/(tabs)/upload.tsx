@@ -1,15 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import Slider from '@react-native-community/slider';
-import { decode } from 'base64-arraybuffer';
 import { CameraType, CameraView, FlashMode, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import { onAuthStateChanged, User } from 'firebase/auth';
-import { addDoc, collection, doc, getDoc, serverTimestamp } from 'firebase/firestore';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -19,19 +15,17 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { MusicSearchSheet } from '@/components/music-search-sheet';
-import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
 import { MusicTrack, toPostSound } from '@/lib/music';
-import { getString } from '@/lib/user-data';
-
-const IMAGE_CONTENT_TYPE = 'image/jpeg';
-const VIDEO_CONTENT_TYPE = 'video/mp4';
-const UPLOAD_ATTEMPTS = 3;
+import {
+  IMAGE_CONTENT_TYPE,
+  isSupabaseConfigured,
+  VIDEO_CONTENT_TYPE,
+} from '@/lib/upload-post';
 
 type UploadMode = 'PHOTO' | 'TEXT' | 'VIDEO';
 
@@ -90,158 +84,25 @@ const TOOLS: { label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
   { label: 'AI', icon: 'color-wand-outline' },
 ];
 
-const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || '';
-const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '';
-const supabaseAccessToken = process.env.EXPO_PUBLIC_SUPABASE_ACCESS_TOKEN || '';
-const supabaseBucket = process.env.EXPO_PUBLIC_SUPABASE_BUCKET || 'media';
-
-let supabaseClient: SupabaseClient | null = null;
-
-function isSupabaseConfigured() {
-  return Boolean(supabaseUrl && supabaseAnonKey);
-}
-
-function getSupabase(): SupabaseClient {
-  if (!isSupabaseConfigured()) {
-    throw new Error(
-      'Supabase is not configured. Add EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY to .env.local, then restart the dev server.',
-    );
-  }
-
-  supabaseClient ??= createClient(supabaseUrl, supabaseAnonKey, {
-    auth: { autoRefreshToken: false, detectSessionInUrl: false, persistSession: false },
-    global: supabaseAccessToken
-      ? { headers: { Authorization: `Bearer ${supabaseAccessToken}` } }
-      : undefined,
-  });
-
-  return supabaseClient;
-}
-
-function toErrorDetails(error: unknown) {
-  return typeof error === 'object' && error !== null
-    ? error as { name?: unknown; message?: unknown; status?: unknown; statusCode?: unknown }
-    : {};
-}
-
-function errorText(error: unknown) {
-  const details = toErrorDetails(error);
-  const name = typeof details.name === 'string' ? details.name : '';
-  const message = typeof details.message === 'string' ? details.message : '';
-
-  return `${name} ${message}`.toLowerCase();
-}
-
-// Android reports connection problems as "fetch failed" plus a nested java.io
-// exception, so the string has to be checked instead of the error name.
-function isNetworkError(error: unknown) {
-  const text = errorText(error);
-
-  return /fetch failed|failed to fetch|network ?request ?failed|networkerror|connectexception|connection ?refused|unable to resolve host|econnreset|econnrefused|etimedout|timeout|socket|load failed|not found/.test(text);
-}
-
-function isUnknownHostError(error: unknown) {
-  return /unable to resolve host|enotfound|name not resolved|nxdomain|getaddrinfo/.test(errorText(error));
-}
-
-function describeError(error: unknown) {
-  const details = toErrorDetails(error);
-  const message = typeof details.message === 'string' ? details.message : '';
-  const statusCode = typeof details.statusCode === 'number'
-    ? details.statusCode
-    : typeof details.status === 'number'
-      ? details.status
-      : 0;
-  const combined = `${typeof details.name === 'string' ? details.name : ''} ${message}`.toLowerCase();
-
-  if (isUnknownHostError(error)) {
-    return `Could not resolve "${supabaseUrl}". Check the Project URL and publishable key in .env.local (Dashboard -> Project Settings -> API), then restart the dev server.`;
-  }
-  if (isNetworkError(error)) {
-    return `This device could not reach Supabase. Your connection dropped while uploading, so the upload was retried ${UPLOAD_ATTEMPTS} times. Check mobile data or Wi-Fi (some networks block Supabase's CDN) and try again.`;
-  }
-  if (statusCode === 401 || statusCode === 403) {
-    return 'Supabase rejected the upload token. Check EXPO_PUBLIC_SUPABASE_ACCESS_TOKEN.';
-  }
-  if (statusCode === 404 || combined.includes('bucket')) {
-    return `Bucket "${supabaseBucket}" was not found. Create it in Supabase Storage, or set EXPO_PUBLIC_SUPABASE_BUCKET.`;
-  }
-  if (combined.includes('row-level security') || combined.includes('policy')) {
-    return 'Supabase Storage policies blocked this upload. Add an INSERT policy for anon and authenticated on the bucket.';
-  }
-  if (error instanceof Error) {
-    return `${error.name}: ${error.message}`;
-  }
-  if (typeof error === 'string' && error.trim()) {
-    return error.trim();
-  }
-  return 'Something went wrong.';
-}
-
-// Large videos over mobile data drop the connection often enough that a single failed
-// request is not enough to call the upload a failure.
-async function uploadWithRetry(fileName: string, fileBody: ArrayBuffer | Blob, contentType: string) {
-  let lastError: unknown;
-
-  for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt += 1) {
-    try {
-      const { error } = await getSupabase()
-        .storage.from(supabaseBucket)
-        .upload(fileName, fileBody, {
-          contentType,
-          upsert: true,
-        });
-
-      if (!error) {
-        return;
-      }
-
-      lastError = error;
-
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    } catch (error) {
-      lastError = error;
-
-      if (!isNetworkError(error)) {
-        throw error;
-      }
-    }
-
-    if (attempt < UPLOAD_ATTEMPTS) {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 800 * attempt);
-      });
-    }
-  }
-
-  throw lastError;
-}
+type Capture = {
+  base64: string;
+  contentType: string;
+  mediaType: 'image' | 'video';
+  uri: string;
+};
 
 export default function UploadScreen() {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [displayName, setDisplayName] = useState('');
-  const [media, setMedia] = useState<{
-    base64: string;
-    contentType: string;
-    mediaType: 'image' | 'video';
-    uri: string;
-  } | null>(null);
-  const [caption, setCaption] = useState('');
+  // Held only long enough for the preview to show the shot as the details screen slides in.
+  const [media, setMedia] = useState<Capture | null>(null);
   const [sound, setSound] = useState<MusicTrack | null>(null);
   const [isPickingSound, setIsPickingSound] = useState(false);
   const [isPicking, setIsPicking] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   // One selection for the whole row. VIDEO is entered by picking a duration, PHOTO and TEXT by
   // picking those pills, and because the highlight is read off this single value only one pill
   // in the row can be lit at a time. It opens on PHOTO, so the durations start unlit.
   const [selectedMode, setSelectedMode] = useState<UploadMode>('PHOTO');
   const [selectedDuration, setSelectedDuration] = useState<(typeof CLIP_LENGTHS)[number]>('15s');
-  // The caption is a second step: DONE in the caption bar is what runs the upload. Keeps the
-  // camera view clear of a keyboard-eating text field.
-  const [showCaptionInput, setShowCaptionInput] = useState(false);
 
   const [facing, setFacing] = useState<CameraType>('back');
   // 0 is the wide camera, 1 is the device's own maximum. The slider writes here and the camera
@@ -262,46 +123,24 @@ export default function UploadScreen() {
     player.loop = true;
   });
 
-  useEffect(() => {
-    let unsubscribe = () => {};
-
-    try {
-      unsubscribe = onAuthStateChanged(getFirebaseAuth(), setCurrentUser);
-    } catch (error) {
-      console.error('Firebase auth is unavailable:', error);
-    }
-
-    return unsubscribe;
-  }, []);
-
-  useEffect(() => {
-    const uid = currentUser?.uid;
-    if (!uid) {
-      return undefined;
-    }
-
-    let isCancelled = false;
-
-    void (async () => {
-      try {
-        const snapshot = await getDoc(doc(getFirebaseDb(), 'users', uid));
-        const data = snapshot.exists() ? snapshot.data() : {};
-        const name = getString(data, ['displayName', 'name', 'username']);
-        if (!isCancelled) {
-          setDisplayName(name || currentUser?.displayName || uid.slice(0, 8));
-        }
-      } catch (error) {
-        console.error('Could not load the profile name:', error);
-        if (!isCancelled) {
-          setDisplayName(currentUser?.displayName || uid.slice(0, 8));
-        }
-      }
-    })();
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [currentUser]);
+  // Every shot ends up here, whether it was captured or picked: the media state is filled in so
+  // the preview shows the frame as the details screen slides over it, and the details screen is
+  // where the title and caption are written and the post is published. The sound is passed as
+  // JSON because a route param can only be a string.
+  const openDetails = useCallback(
+    (next: Capture) => {
+      setMedia(next);
+      router.push({
+        params: {
+          mediaType: next.mediaType,
+          ...(sound ? { sound: JSON.stringify(toPostSound(sound)) } : {}),
+          uri: next.uri,
+        },
+        pathname: '/post-details',
+      });
+    },
+    [sound],
+  );
 
   // 1. Pick a photo or video. Images come back as base64; videos do not on every
   // platform, so videos are uploaded from the uri with fetch + blob().
@@ -336,7 +175,7 @@ export default function UploadScreen() {
         return;
       }
 
-      setMedia({
+      openDetails({
         base64,
         contentType: mediaType === 'video' ? VIDEO_CONTENT_TYPE : IMAGE_CONTENT_TYPE,
         mediaType,
@@ -348,7 +187,7 @@ export default function UploadScreen() {
     } finally {
       setIsPicking(false);
     }
-  }, [selectedMode]);
+  }, [openDetails, selectedMode]);
 
   // Asks for the camera, and the microphone too when a clip is about to be recorded with
   // sound. Resolves false when a permission was refused, so the caller can say so instead of
@@ -409,7 +248,7 @@ export default function UploadScreen() {
         return;
       }
 
-      setMedia({
+      openDetails({
         base64: picture.base64,
         contentType: IMAGE_CONTENT_TYPE,
         mediaType: 'image',
@@ -421,7 +260,7 @@ export default function UploadScreen() {
     } finally {
       setIsCapturing(false);
     }
-  }, [ensureCameraPermissions, isCapturing]);
+  }, [ensureCameraPermissions, isCapturing, openDetails]);
 
   // Video mode: the button starts the recording and the same button stops it, the way a
   // camera app behaves. recordAsync only settles once the recording ends, so it is started
@@ -454,7 +293,7 @@ export default function UploadScreen() {
         return;
       }
 
-      setMedia({
+      openDetails({
         // Videos are uploaded from the uri, so no base64 is needed here.
         base64: '',
         contentType: VIDEO_CONTENT_TYPE,
@@ -467,7 +306,7 @@ export default function UploadScreen() {
     } finally {
       setIsRecording(false);
     }
-  }, [selectedDuration, ensureCameraPermissions, isCapturing, isRecording]);
+  }, [selectedDuration, ensureCameraPermissions, isCapturing, isRecording, openDetails]);
 
   // What the record button does: one shot in photo mode, otherwise a recording that the same
   // button stops.
@@ -505,105 +344,9 @@ export default function UploadScreen() {
     setFacing((current) => (current === 'back' ? 'front' : 'back'));
   }, [isRecording]);
 
-  const uploadPost = useCallback(async () => {
-    if (!currentUser) {
-      Alert.alert('Login required', 'You need to be logged in.');
-      return;
-    }
-    if (!media || !caption.trim()) {
-      Alert.alert('Missing details', 'Please add a photo/video and a caption.');
-      return;
-    }
-
-    setIsUploading(true);
-    setErrorMessage('');
-
-    const extension = media.mediaType === 'video' ? 'mp4' : 'jpg';
-    const fileName = `${currentUser.uid}_${Date.now()}.${extension}`;
-    const contentType = media.mediaType === 'video' ? VIDEO_CONTENT_TYPE : IMAGE_CONTENT_TYPE;
-    let byteLength = 0;
-
-    try {
-      let fileBody: ArrayBuffer | Blob;
-
-      if (media.mediaType === 'video') {
-        // 2. Video: base64 is not available, so read the file with fetch and take a blob.
-        const response = await fetch(media.uri);
-
-        if (!response.ok) {
-          throw new Error(`Could not read the video file (status ${response.status}).`);
-        }
-
-        const blob = await response.blob();
-        byteLength = blob.size;
-        // supabase-js ignores options.contentType for Blob bodies and uses the blob type
-        // for the multipart part, so the blob type is set explicitly.
-        fileBody = blob.type.startsWith('video/')
-          ? blob
-          : new Blob([blob], { type: VIDEO_CONTENT_TYPE });
-      } else {
-        // 1. Image: convert the base64 string into an ArrayBuffer.
-        if (!media.base64) {
-          throw new Error('Could not get file info. Please try again.');
-        }
-
-        const arrayBuffer = decode(media.base64);
-        byteLength = arrayBuffer.byteLength;
-        fileBody = arrayBuffer;
-      }
-
-      // 3. Upload to Supabase Storage. Without contentType it is stored as text/plain.
-      await uploadWithRetry(fileName, fileBody, contentType);
-
-      const { data } = getSupabase().storage.from(supabaseBucket).getPublicUrl(fileName);
-      const mediaUrl = data.publicUrl;
-
-      // 4. Save the post in the Firestore posts collection.
-      await addDoc(collection(getFirebaseDb(), 'posts'), {
-        // Started at zero so the comment counter on the post is a real number from the
-        // first moment, which is what the transaction in lib/comments.ts reads.
-        caption: caption.trim(),
-        commentsCount: 0,
-        createdAt: serverTimestamp(),
-        displayName: displayName || currentUser.displayName || 'User',
-        mediaType: media.mediaType,
-        mediaUrl,
-        // Only copied field by field rather than spreading the search result, so a post can
-        // never carry anything the feed does not expect. The attribution fields come along
-        // because a CC BY track has to name the artist and the licence.
-        ...(sound ? { sound: toPostSound(sound) } : {}),
-        userId: currentUser.uid,
-      });
-    } catch (error) {
-      // 5. Detailed error logging
-      console.error('Upload failed', {
-        bucket: supabaseBucket,
-        bytes: byteLength,
-        caption: caption.trim(),
-        contentType,
-        error,
-        errorMessage: describeError(error),
-        fileName,
-        mediaType: media.mediaType,
-        source: media.mediaType === 'video' ? 'fetch-blob' : 'base64-arraybuffer',
-        supabaseUrl,
-        userId: currentUser.uid,
-      });
-      setErrorMessage(describeError(error));
-      setIsUploading(false);
-      return;
-    }
-
-    setIsUploading(false);
-    setCaption('');
-    setMedia(null);
-    setSound(null);
-    setShowCaptionInput(false);
-    Alert.alert('Success', 'Post uploaded successfully.');
-    router.replace('/home');
-  }, [caption, currentUser, displayName, media, sound]);
-
-  const isBusy = isUploading || isPicking;
+// The camera screen only captures. The title, the caption and the upload itself belong to the
+  // post details screen.
+  const isBusy = isPicking;
 
   const comingSoon = useCallback((label: string) => {
     Alert.alert(label, 'This control is part of the new camera UI. Capture and editing are not wired up yet.');
@@ -908,38 +651,11 @@ export default function UploadScreen() {
             <Text style={[styles.modePillText, selectedMode === 'TEXT' && styles.modePillTextActive]}>TEXT</Text>
           </Pressable>
         </View>
-
-        {showCaptionInput ? (
-          <View style={styles.captionBar}>
-            <TextInput
-              editable={!isUploading}
-              maxLength={220}
-              onChangeText={setCaption}
-              placeholder="Write a caption..."
-              placeholderTextColor="rgba(255, 255, 255, 0.5)"
-              style={styles.captionField}
-              value={caption}
-            />
-            <Pressable
-              accessibilityLabel="Upload post"
-              accessibilityRole="button"
-              disabled={isBusy}
-              onPress={() => void uploadPost()}
-              style={({ pressed }) => [styles.captionDone, pressed && styles.pressed, isBusy && styles.disabled]}
-            >
-              {isUploading ? (
-                <ActivityIndicator color="#FFFFFF" />
-              ) : (
-                <Text style={styles.captionDoneText}>DONE</Text>
-              )}
-            </Pressable>
-          </View>
-        ) : null}
       </View>
 
-      {/* Bottom bar: album on the left, the record button dead centre, POST on the right. The
-          two sides are equal flex slots so the circle lands in the middle of the bar whatever
-          the album and the word measure. */}
+      {/* Bottom bar: album on the left, the record button dead centre. The right slot is an empty
+          twin of the album slot, so the circle lands in the middle of the bar instead of drifting
+          towards the album. */}
       <View style={styles.bottomBar}>
         <View style={styles.bottomBarSide}>
           <Pressable
@@ -966,29 +682,14 @@ export default function UploadScreen() {
                 : `Record a ${selectedDuration} clip`
           }
           accessibilityRole="button"
-          disabled={!media && (!isCameraReady || !cameraPermission?.granted)}
+          disabled={!isCameraReady || !cameraPermission?.granted}
           onPress={onRecordPress}
           style={({ pressed }) => [styles.shutterOuter, pressed && styles.pressed]}
         >
           <View style={[styles.shutterInner, isRecording && styles.shutterInnerRecording]} />
         </Pressable>
 
-        <View style={[styles.bottomBarSide, styles.bottomBarSideEnd]}>
-          <Pressable
-            accessibilityLabel="Start over"
-            accessibilityRole="button"
-            disabled={isBusy}
-            onPress={() => {
-              setMedia(null);
-              setCaption('');
-              setSound(null);
-              setShowCaptionInput(false);
-            }}
-            style={({ pressed }) => [styles.bottomAction, pressed && styles.pressed, isBusy && styles.disabled]}
-          >
-            <Text style={styles.postLabel}>POST</Text>
-          </Pressable>
-        </View>
+        <View style={styles.bottomBarSide} />
       </View>
       </KeyboardAvoidingView>
 
@@ -1101,40 +802,6 @@ const styles = StyleSheet.create({
     color: '#F2D9B4',
     fontSize: 11,
     lineHeight: 16,
-  },
-  // Sits under the selected media, above the POST and CREATE row, and only exists once the
-  // user has asked for the caption step.
-  captionBar: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 10,
-    paddingHorizontal: 15,
-    paddingVertical: 10,
-  },
-  captionField: {
-    backgroundColor: 'rgba(255, 255, 255, 0.12)',
-    borderColor: 'rgba(255, 255, 255, 0.28)',
-    borderRadius: 999,
-    borderWidth: 1,
-    color: '#FFFFFF',
-    flex: 1,
-    fontSize: 14,
-    paddingHorizontal: 16,
-    paddingVertical: 11,
-  },
-  captionDone: {
-    alignItems: 'center',
-    backgroundColor: '#FE2C55',
-    borderRadius: 999,
-    justifyContent: 'center',
-    minHeight: 44,
-    paddingHorizontal: 20,
-  },
-  captionDoneText: {
-    color: '#FFFFFF',
-    fontSize: 14,
-    fontWeight: '900',
-    letterSpacing: 1,
   },
   toolRail: {
     // Floats over the full width viewfinder rather than sitting beside it, so the camera is not
@@ -1337,14 +1004,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingTop: 10,
   },
-  // The album and the word are wrapped in two equal flex slots. space-between alone would put
-  // the record circle wherever the two labels happened to end, so it would drift off centre.
+  // The album and the empty right slot are two equal flex rows. space-between alone would put the
+  // record circle wherever the album happened to end, so it would drift off centre.
   bottomBarSide: {
     flex: 1,
     justifyContent: 'center',
-  },
-  bottomBarSideEnd: {
-    alignItems: 'flex-end',
   },
   // TikTok's record button: a white ring around a red disc. The ring is the outer view's
   // border, so it stays even while the inner disc shrinks to a square while recording.
@@ -1368,18 +1032,6 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     height: 36,
     width: 36,
-  },
-  // Only the tap target is styled; the word carries the look on its own.
-  bottomAction: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 6,
-  },
-  postLabel: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: 'bold',
-    letterSpacing: 1,
   },
   albumButton: {
     alignItems: 'center',

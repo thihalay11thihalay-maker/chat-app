@@ -7,7 +7,7 @@ rules_version = '2';
 //   users/{uid}/following/{userId}  - who this user follows
 //   posts/{postId}                  - feed posts
 //   posts/{postId}/reactions/{uid}  - { liked, loved } per reacting user
-//   posts/{postId}/comments/{id}    - { userId, displayName, text, replyToName }
+//   posts/{postId}/comments/{id}    - { userId, displayName, text, replyToName, parentId }
 //   chats/{chatId}                  - participants[] (uids), lastMessage, ...
 //   chats/{chatId}/messages/{msgId} - senderId, type, text/mediaUrl
 //
@@ -89,8 +89,21 @@ service cloud.firestore {
 
         allow update: if false;
 
-        // Only the author can take a comment back down.
-        allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+        // The author can take a comment back down. Replies go with the comment they hang
+        // under, so the second case lets the author of a comment also remove the replies
+        // underneath it, which are documents other people wrote. Without it a thread with
+        // replies could not be deleted at all: the replies would be denied and the whole
+        // transaction would fail. A reply is still only removable through its parent, never
+        // by anyone else.
+        allow delete: if isSignedIn()
+          && (
+            resource.data.userId == request.auth.uid
+            || (
+              resource.data.parentId is string
+              && exists(/databases/$(database)/documents/posts/$(postId)/comments/$(resource.data.parentId))
+              && get(/databases/$(database)/documents/posts/$(postId)/comments/$(resource.data.parentId)).data.userId == request.auth.uid
+            )
+          );
       }
     }
 

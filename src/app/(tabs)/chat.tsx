@@ -11,104 +11,13 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-type InboxChat = {
-  id: string;
-  name: string;
-  avatar: string;
-  snippet: string;
-  time: string;
-  unread: number;
-  online: boolean;
-  kind: 'direct' | 'group';
-  age?: number;
-  gender?: 'male' | 'female';
-  distance?: string;
-};
+import { MockChat, MOCK_CHATS } from '@/lib/mock-chats';
 
 type FilterKey = 'All' | 'Friends' | 'Group Chats';
 
 const FILTERS: FilterKey[] = ['All', 'Friends', 'Group Chats'];
 
-// Placeholder rows so the layout can be judged against real content. Avatars are a public
-// placeholder service, not people.
-const MOCK_CHATS: InboxChat[] = [
-  {
-    age: 24,
-    avatar: 'https://i.pravatar.cc/150?img=12',
-    distance: '3 km away',
-    gender: 'female',
-    id: 'mock-1',
-    kind: 'direct',
-    name: 'HninKyaing',
-    online: true,
-    snippet: 'Are you free this evening?',
-    time: '10m ago',
-    unread: 3,
-  },
-  {
-    age: 29,
-    avatar: 'https://i.pravatar.cc/150?img=32',
-    distance: '1.2 km away',
-    gender: 'female',
-    id: 'mock-2',
-    kind: 'direct',
-    name: 'Nwe Lay',
-    online: false,
-    snippet: 'Sent a voice message',
-    time: '19m ago',
-    unread: 0,
-  },
-  {
-    avatar: 'https://i.pravatar.cc/150?img=45',
-    id: 'mock-3',
-    kind: 'group',
-    name: 'Weekend Trip Group',
-    online: true,
-    snippet: 'Mon: does anyone still need a ride?',
-    time: '1h ago',
-    unread: 12,
-  },
-  {
-    age: 31,
-    avatar: 'https://i.pravatar.cc/150?img=5',
-    distance: '8 km away',
-    gender: 'male',
-    id: 'mock-4',
-    kind: 'direct',
-    name: 'Mon',
-    online: true,
-    snippet: 'That sounds good to me 👍',
-    time: '2h ago',
-    unread: 1,
-  },
-  {
-    avatar: 'https://i.pravatar.cc/150?img=20',
-    id: 'mock-5',
-    kind: 'group',
-    name: 'Book Club',
-    online: false,
-    snippet: 'Aye: chapter 4 discussion at 7?',
-    time: 'Yesterday',
-    unread: 0,
-  },
-  {
-    age: 27,
-    avatar: 'https://i.pravatar.cc/150?img=68',
-    distance: '450 m away',
-    gender: 'female',
-    id: 'mock-6',
-    kind: 'direct',
-    name: 'Thiri Aung',
-    online: false,
-    snippet: 'Haha, okay you win',
-    time: 'Yesterday',
-    unread: 0,
-  },
-];
-
-// Filters the same list three ways rather than reaching for three different sources: Friends
-// narrows to the people who are around now, Group Chats to the multi-person threads.
-function filterChats(chats: InboxChat[], filter: FilterKey) {
+function filterChats(chats: MockChat[], filter: FilterKey) {
   if (filter === 'Friends') {
     return chats.filter((chat) => chat.kind === 'direct' && chat.online);
   }
@@ -120,7 +29,7 @@ function filterChats(chats: InboxChat[], filter: FilterKey) {
   return chats;
 }
 
-function ChatRow({ chat }: { chat: InboxChat }) {
+function ChatRow({ chat }: { chat: MockChat }) {
   const genderIcon = chat.gender === 'female' ? 'female' : 'male';
   const genderColor = chat.gender === 'female' ? '#F06292' : '#4FA3E3';
 
@@ -128,9 +37,9 @@ function ChatRow({ chat }: { chat: InboxChat }) {
     <Pressable
       accessibilityLabel={`Chat with ${chat.name}${chat.unread > 0 ? `, ${chat.unread} unread` : ''}`}
       accessibilityRole="button"
-      // The mock rows have no chat document behind them, so this only opens a thread once the
-      // list is wired back to real ids.
-      onPress={() => router.push('/friends' as never)}
+      // This is the conversation, not discovery. The id is the row's own, so it lands on the
+      // thread for the person whose name is on screen.
+      onPress={() => router.push(`/chat/${chat.id}` as never)}
       style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
     >
       <View style={styles.avatarWrap}>
@@ -182,7 +91,7 @@ export default function ChatListScreen() {
           <Pressable
             accessibilityLabel="Find friends"
             accessibilityRole="button"
-            onPress={() => router.push('/friends' as never)}
+            onPress={() => router.push('/find-friends' as never)}
             style={({ pressed }) => [styles.findFriendsHit, pressed && styles.rowPressed]}
           >
             <Text style={styles.findFriends}>Find Friends</Text>

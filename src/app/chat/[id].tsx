@@ -30,12 +30,17 @@ import { ChatMessage, MessageBubble } from '@/components/chat-message-bubble';
 import { useChatMedia } from '@/hooks/use-chat-media';
 
 import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
+import { findMockChat } from '@/lib/mock-chats';
 
 export default function ChatDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const chatId = Array.isArray(id) ? id[0] : id || 'chat';
+  // A mock inbox row pushes its own id here. Firestore has no such chat, and the security
+  // rules would refuse the read, so those ids are answered from the mock list instead and the
+  // listener below is never started for them.
+  const mockChat = findMockChat(chatId);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(mockChat?.messages ?? []);
   const [messageText, setMessageText] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -59,6 +64,10 @@ export default function ChatDetailScreen() {
   };
 
   useEffect(() => {
+    if (mockChat) {
+      return undefined;
+    }
+
     const messagesQuery = query(
       collection(getFirebaseDb(), 'chats', chatId, 'messages'),
       orderBy('createdAt', 'asc'),
@@ -74,7 +83,7 @@ export default function ChatDetailScreen() {
       console.error('Failed to load chat messages:', error);
       setLoadError('Could not load messages.');
     });
-  }, [chatId]);
+  }, [chatId, mockChat]);
 
   useEffect(() => {
     let unsubscribe = () => {};
@@ -129,7 +138,7 @@ export default function ChatDetailScreen() {
               screen, and numberOfLines has nothing to shrink into. */}
           <View style={styles.headerTitle}>
             <Text ellipsizeMode="tail" numberOfLines={1} style={styles.eyebrow}>CONVERSATION</Text>
-            <Text ellipsizeMode="tail" numberOfLines={1} style={styles.title}>{`Chat ${chatId}`}</Text>
+            <Text ellipsizeMode="tail" numberOfLines={1} style={styles.title}>{mockChat ? mockChat.name : `Chat ${chatId}`}</Text>
           </View>
           <View style={styles.headerActions}>
             <Pressable

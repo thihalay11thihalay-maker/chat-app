@@ -8,7 +8,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Animated,
   FlatList,
   LayoutChangeEvent,
   NativeScrollEvent,
@@ -26,6 +25,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { CommentSheet } from '@/components/comment-sheet';
 import { TAB_BAR_HEIGHT } from '@/components/curved-tab-bar';
+import { ExploreContent } from '@/components/explore-content';
 import { getFirebaseAuth, getFirebaseDb, isFirestorePermissionError } from '@/lib/firebase';
 import { PostSound, resolveStreamUrl, toPostSoundValue } from '@/lib/music';
 
@@ -35,6 +35,9 @@ interface Post {
   mediaType?: 'image' | 'video';
   mediaUrl?: string;
   caption?: string;
+  /** Longer form text from the post details screen, shown under the title. */
+  description?: string;
+  title?: string;
   createdAt?: Timestamp | Date | null;
   commentsCount: number;
   lovesCount: number;
@@ -88,6 +91,9 @@ function toPost(id: string, data: Record<string, unknown>): Post {
     caption: typeof data.caption === 'string' ? data.caption : undefined,
     commentsCount: toCount(data, 'commentsCount'),
     createdAt: createdAt instanceof Date || createdAt instanceof Timestamp ? createdAt : null,
+    // Posts written before the details screen have neither field, so both read as absent rather
+    // than as an empty line above the caption.
+    description: typeof data.description === 'string' ? data.description : undefined,
     displayName: typeof data.displayName === 'string' ? data.displayName : undefined,
     lovesCount: toCount(data, 'lovesCount'),
     likesCount: toCount(data, 'likesCount'),
@@ -97,6 +103,7 @@ function toPost(id: string, data: Record<string, unknown>): Post {
     // A post without a usable sound object is treated as having no sound, so one bad document
     // cannot break the row.
     sound: toPostSoundValue(data.sound) ?? undefined,
+    title: typeof data.title === 'string' ? data.title : undefined,
     userId: typeof data.userId === 'string' ? data.userId : '',
   };
 }
@@ -493,6 +500,9 @@ export default function Home() {
   // safe area makes the page height and the item height disagree and snapping drifts. The
   // window is only the first guess, before the list has been laid out.
   const [pageHeight, setPageHeight] = useState(() => windowHeight);
+  // One bar owns the pill and the search button, measured once so the content underneath can
+  // start below it without either of them guessing an offset.
+  const [topBarHeight, setTopBarHeight] = useState(0);
   const [activeIndex, setActiveIndex] = useState(0);
   const [isScrolling, setIsScrolling] = useState(false);
   const [selectedTab, setSelectedTab] = useState('Friends');
@@ -632,8 +642,8 @@ export default function Home() {
           )}
         </View>
 
-        {/* Only the caption: the author name lives in the social bar, and repeating it
-            here stacked the same @name on top of the bar. */}
+        {/* Title first, then the longer description: only these two, because the author name
+            lives in the social bar and repeating it here stacked the same @name on top. */}
         <View style={[styles.overlay, { bottom: bottomChrome + SOCIAL_BAR_HEIGHT }]}>
           <PostSoundRow
             isActive={isCurrentPost}
@@ -641,7 +651,13 @@ export default function Home() {
             onToggleMute={toggleSoundMute}
             sound={item.sound}
           />
-          <CaptionText caption={item.caption} />
+          <PostTitle title={item.title} />
+          <CaptionText
+            // A titled post with no description reads as the title alone. "No caption" is only
+            // shown when the post has no text of its own to show.
+            caption={item.description?.trim() || item.caption}
+            placeholder={item.title?.trim() ? null : 'No caption'}
+          />
         </View>
 
         <SocialActions
@@ -673,7 +689,13 @@ export default function Home() {
 
   return (
     <View style={styles.container}>
-      {posts.length === 0 ? (
+      {/* Explore replaces the feed rather than sitting over it. Leaving the paged list mounted
+          underneath would keep the current video playing behind a white screen. */}
+      {selectedTab === 'Explore' ? (
+        // Measured, not guessed: the explore view starts under the bar whatever the status bar
+        // inset and the pill height come to on the device.
+        <ExploreContent topInset={topBarHeight + 12} />
+      ) : posts.length === 0 ? (
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyText}>No posts yet.</Text>
           <Text style={styles.emptySubText}>Be the first to upload!</Text>
@@ -701,16 +723,21 @@ export default function Home() {
         />
       )}
 
-      <FeedTabs onSelect={setSelectedTab} selectedTab={selectedTab} />
-
-      <Pressable
-        accessibilityLabel="Search"
-        accessibilityRole="button"
-        onPress={() => router.push('/search')}
-        style={styles.searchButton}
+      <View
+        onLayout={(event) => setTopBarHeight(event.nativeEvent.layout.height)}
+        style={[styles.topBar, { paddingTop: insets.top + 8 }]}
       >
-        <Ionicons color="#FFFFFF" name="search" size={26} />
-      </Pressable>
+        <FeedTabs onSelect={setSelectedTab} selectedTab={selectedTab} />
+
+        <Pressable
+          accessibilityLabel="Search"
+          accessibilityRole="button"
+          onPress={() => router.push('/search')}
+          style={styles.searchButton}
+        >
+          <Ionicons color="#FFFFFF" name="search" size={24} />
+        </Pressable>
+      </View>
 
       <CommentSheet
         onClose={closeComments}
@@ -725,11 +752,34 @@ export default function Home() {
 // Splits on #tags so they can be tinted without pulling in a markdown style parser.
 const HASHTAG_PATTERN = /(#[\wÀ-ɏ]+)/g;
 
-function CaptionText({ caption }: { caption?: string }) {
+// The headline from the details screen. One line only: the description underneath it has room for
+// the rest, and a second clipped line of title just pushes the caption off the bottom.
+function PostTitle({ title }: { title?: string }) {
+  const text = title?.trim();
+
+  if (!text) {
+    return null;
+  }
+
+  return (
+    <Text numberOfLines={2} style={styles.postTitle}>
+      {text}
+    </Text>
+  );
+}
+
+function CaptionText({
+  caption,
+  placeholder,
+}: {
+  caption?: string;
+  /** Null renders nothing at all, which is how a titled post with no description reads. */
+  placeholder?: string | null;
+}) {
   const text = caption?.trim();
 
   if (!text) {
-    return <Text style={styles.caption}>No caption</Text>;
+    return placeholder ? <Text style={styles.caption}>{placeholder}</Text> : null;
   }
 
   // Nested Text keeps the whole caption as one paragraph, so numberOfLines can still
@@ -1317,12 +1367,7 @@ function SocialActions({
   );
 }
 
-// Each tab is a label plus the 12px margins on both sides, so the sliding underline is
-// sized and stepped by the same distance and lines up under the label.
-const TAB_LABEL_GAP = 24;
-const TAB_STRIDE = 72;
-
-const FEED_TABS = ['Friends', 'Public', 'Live'] as const;
+const FEED_TABS = ['Follow', 'Friends', 'Public', 'Live', 'Explore'] as const;
 
 function FeedTabs({
   onSelect,
@@ -1331,23 +1376,13 @@ function FeedTabs({
   onSelect: (tab: string) => void;
   selectedTab: string;
 }) {
-  // Held in state rather than a ref: the value is created once and read during render.
-  const [translateX] = useState(() => new Animated.Value(0));
-  const activeIndex = Math.max(FEED_TABS.indexOf(selectedTab as typeof FEED_TABS[number]), 0);
-
-  // The underline is a single view that slides to the width of the selected tab instead of
-  // three separate lines, which is what gives the TikTok feel.
-  useEffect(() => {
-    Animated.spring(translateX, {
-      toValue: activeIndex * TAB_STRIDE,
-      useNativeDriver: true,
-      speed: 18,
-      bounciness: 6,
-    }).start();
-  }, [activeIndex, translateX]);
-
+  // The active tab is the selectedTab that lives in Home, because that same value decides what
+  // the screen renders below. A second activeTab kept here would be free to disagree with it.
+  //
+  // The underline is drawn inside the active tab rather than slid between them. A sliding bar
+  // has to be told where the labels ended up, and that measurement is what left it stranded
+  // under the wrong word when the row reflowed.
   return (
-    // Absolute so the tabs float over the video instead of taking space from it.
     <View style={styles.feedTabsWrapper}>
       <View style={styles.feedTabsRow}>
         {FEED_TABS.map((tab) => {
@@ -1361,15 +1396,14 @@ function FeedTabs({
               onPress={() => onSelect(tab)}
               style={styles.feedTab}
             >
-              <Text style={[styles.feedTabText, isActive ? styles.feedTabTextActive : null]}>
-                {tab}
-              </Text>
+              <Text style={[styles.feedTabText, isActive && styles.feedTabTextActive]}>{tab}</Text>
+              {/* Present on every tab and transparent when inactive, so the row never changes
+                  height as the selection moves. */}
+              <View style={[styles.feedUnderline, isActive && styles.feedUnderlineActive]} />
             </Pressable>
           );
         })}
       </View>
-
-      <Animated.View style={[styles.feedTabUnderline, { transform: [{ translateX }] }]} />
     </View>
   );
 }
@@ -1390,6 +1424,8 @@ const styles = StyleSheet.create({
   // a little breathing room. The offset itself is applied at render, because the tab bar
   // height and the phone inset are only known on the device.
   overlay: { position: 'absolute', left: 16, right: 16, marginBottom: 10 },
+  // Heavier than the description under it, so the headline reads first at a glance.
+  postTitle: { color: '#FFFFFF', fontSize: 16, fontWeight: '700', lineHeight: 21, marginBottom: 4 },
   caption: { color: '#FFFFFF', fontSize: 14, lineHeight: 19 },
   soundLabel: {
     alignItems: 'center',
@@ -1466,39 +1502,61 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     textAlign: 'center',
   },
-  feedTabsWrapper: {
+  // The bar floats over the video rather than shortening the page, and it owns the pill and the
+  // search button in one row so the two can never land on top of each other. It starts below
+  // the status bar instead of at a fixed offset.
+  topBar: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    left: 0,
+    paddingHorizontal: 12,
     position: 'absolute',
-    top: 50,
-    alignSelf: 'center',
+    right: 0,
+    top: 0,
+    zIndex: 10,
+  },
+  feedTabsWrapper: {
+    // Takes all the width the search button leaves, so the five labels share it evenly instead
+    // of sizing to their text and running off the right edge.
+    flex: 1,
     zIndex: 10,
     // Translucent black, the same fill as the tab bar below, so the video shows through both
     // bars. The pill shape keeps the tint from sitting as a hard band across the post.
     backgroundColor: 'rgba(0, 0, 0, 0.4)',
     borderRadius: 999,
-    paddingHorizontal: 8,
+    paddingHorizontal: 6,
     paddingVertical: 2,
   },
-  // Same top as the tabs so the icon lines up with their labels, pinned to the right edge.
   searchButton: {
-    position: 'absolute',
-    right: 20,
-    top: 50,
-    zIndex: 10,
-    padding: 4,
+    alignItems: 'center',
+    // The same tint as the pill, because the glyph is white and a white icon on the explore
+    // screen's white background would be invisible without it.
+    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    borderRadius: 999,
+    height: 38,
+    justifyContent: 'center',
+    marginLeft: 10,
+    width: 38,
   },
   feedTabsRow: {
-    flexDirection: 'row',
     alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
   },
   feedTab: {
-    marginHorizontal: 12,
+    // An equal share of the row each, centred, so the labels are evenly distributed and none
+    // of them can be pushed off the end of the pill.
+    alignItems: 'center',
+    flex: 1,
     paddingVertical: 6,
   },
   feedTabText: {
     // White at reduced opacity, so the inactive tabs stay readable over a bright frame of the
-    // video and the active one still stands out.
+    // video and the active one still stands out. 14 rather than 15 because five labels now
+    // share the row and each one has its own slot in it.
     color: '#FFFFFF',
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: 'bold',
     opacity: 0.65,
   },
@@ -1506,16 +1564,15 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     opacity: 1,
   },
-  feedTabUnderline: {
-    position: 'absolute',
-    // 8 is the pill padding and 12 the tab margin, so the underline still starts under the
-    // first label rather than under the rounded edge of the pill.
-    bottom: 0,
-    left: 20,
-    height: 3,
+  feedUnderline: {
+    backgroundColor: 'transparent',
     borderRadius: 2,
+    height: 3,
+    marginTop: 5,
+    width: 18,
+  },
+  feedUnderlineActive: {
     backgroundColor: '#FFFFFF',
-    width: TAB_STRIDE - TAB_LABEL_GAP,
   },
   socialBar: {
     position: 'absolute',

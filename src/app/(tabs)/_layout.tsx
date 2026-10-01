@@ -14,12 +14,12 @@ const TABS: (TabItem & { name: string })[] = [
     name: 'home',
   },
   {
-    activeIcon: 'people',
-    href: '/friends',
-    icon: 'people-outline',
-    key: 'friends',
-    label: 'Friends',
-    name: 'friends',
+    activeIcon: 'radio',
+    href: '/live',
+    icon: 'radio-outline',
+    key: 'live',
+    label: 'Live',
+    name: 'live',
   },
   {
     activeIcon: 'add',
@@ -100,6 +100,12 @@ export default function TabsLayout() {
           }}
         />
       ))}
+
+      {/* Friends lost its slot on the bar to Live, but the screen still exists and the inbox
+          links into it. href null keeps it registered and reachable while leaving it out of the
+          bar; without this the route would be an undeclared child of Tabs and pushing to it
+          would fail. */}
+      <Tabs.Screen name="friends" options={{ href: null, title: 'Friends' }} />
     </Tabs>
   );
 }

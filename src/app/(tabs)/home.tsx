@@ -3,13 +3,15 @@ import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { router, useIsFocused } from 'expo-router';
 import { Image } from 'expo-image';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import { collection, deleteDoc, doc, getDoc, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
+import { collection, deleteDoc, doc, getDoc, limit, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp, where, type DocumentData, type Query } from 'firebase/firestore';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   FlatList,
   LayoutChangeEvent,
+  Modal,
   NativeScrollEvent,
   NativeSyntheticEvent,
   PanResponder,
@@ -28,12 +30,23 @@ import { TAB_BAR_HEIGHT } from '@/components/curved-tab-bar';
 import { ExploreContent } from '@/components/explore-content';
 import { getFirebaseAuth, getFirebaseDb, isFirestorePermissionError } from '@/lib/firebase';
 import { PostSound, resolveStreamUrl, toPostSoundValue } from '@/lib/music';
+import { removePostMedia, storagePathFromUrl } from '@/lib/supabase';
 
 interface Post {
   id: string;
+  /** Flat colour standing in for the media on a text post. */
+  backgroundColor?: string;
   displayName?: string;
   mediaType?: 'image' | 'video';
   mediaUrl?: string;
+  /**
+   * Every photo on the post. `mediaUrl` stays the cover the feed draws, so this is the full set
+   * behind it. A post written before the editor existed has no array, so it reads as the cover
+   * alone rather than as an empty post.
+   */
+  mediaUrls?: string[];
+  /** Who the post is published to. Public when absent, which is how every post behaved before. */
+  visibility?: string;
   caption?: string;
   /** Longer form text from the post details screen, shown under the title. */
   description?: string;
@@ -82,12 +95,43 @@ function toCount(data: Record<string, unknown>, key: string) {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
 }
 
+/**
+ * The photo a post row draws, from whichever field carries it.
+ *
+ * `mediaUrl` is the cover and the array is the full set. The array is consulted as well because
+ * documents written before the create path saved `mediaUrl` have only that, and reading the cover
+ * alone left those posts with no photo at all.
+ */
+function coverFrom(data: Record<string, unknown>): string | undefined {
+  if (typeof data.mediaUrl === 'string' && data.mediaUrl) {
+    return data.mediaUrl;
+  }
+
+  if (Array.isArray(data.mediaUrls)) {
+    const first = data.mediaUrls.find(
+      (item): item is string => typeof item === 'string' && /^https?:\/\//i.test(item),
+    );
+
+    if (first) {
+      return first;
+    }
+  }
+
+  return undefined;
+}
+
 function toPost(id: string, data: Record<string, unknown>): Post {
   const createdAt = data.createdAt;
   const mediaType = data.mediaType;
 
-  return {
+  const post: Post = {
     id,
+    // Only a hex colour is trusted: this string goes straight onto a view's background, so a
+    // hand-edited document cannot smuggle anything else into the feed's styling.
+    backgroundColor:
+      typeof data.backgroundColor === 'string' && /^#[0-9A-Fa-f]{6}$/.test(data.backgroundColor)
+        ? data.backgroundColor
+        : undefined,
     caption: typeof data.caption === 'string' ? data.caption : undefined,
     commentsCount: toCount(data, 'commentsCount'),
     createdAt: createdAt instanceof Date || createdAt instanceof Timestamp ? createdAt : null,
@@ -98,14 +142,44 @@ function toPost(id: string, data: Record<string, unknown>): Post {
     lovesCount: toCount(data, 'lovesCount'),
     likesCount: toCount(data, 'likesCount'),
     mediaType: mediaType === 'image' || mediaType === 'video' ? mediaType : undefined,
-    mediaUrl: typeof data.mediaUrl === 'string' ? data.mediaUrl : undefined,
+    // The cover, falling back to the first entry of the array when the field is absent.
+    //
+    // Posts created before the writer started saving `mediaUrl` carry only `mediaUrls`, and this
+    // fallback is what makes their photo appear instead of the placeholder. It is a read-side
+    // repair, so it heals every existing document at once instead of waiting on a backfill; new
+    // posts save both fields, so the fallback never fires for them.
+    mediaUrl: coverFrom(data),
+    // The full set behind the cover, with anything that is not a usable http url dropped. A post
+    // with no array falls back to its single cover, so nothing written before the editor existed
+    // comes back as an empty list.
+    mediaUrls:
+      Array.isArray(data.mediaUrls) && data.mediaUrls.some((item) => typeof item === 'string')
+        ? (data.mediaUrls as unknown[]).filter(
+            (item): item is string => typeof item === 'string' && /^https?:\/\//i.test(item),
+          )
+        : typeof data.mediaUrl === 'string' && data.mediaUrl
+          ? [data.mediaUrl]
+          : [],
     sharesCount: toCount(data, 'sharesCount'),
+    // Absent on posts written before visibility existed, which the rules treat as public, so the
+    // indicator is left off rather than showing a lock nobody set.
+    visibility: typeof data.visibility === 'string' ? data.visibility : undefined,
     // A post without a usable sound object is treated as having no sound, so one bad document
     // cannot break the row.
     sound: toPostSoundValue(data.sound) ?? undefined,
     title: typeof data.title === 'string' ? data.title : undefined,
     userId: typeof data.userId === 'string' ? data.userId : '',
   };
+  // The other half of the diagnostic the upload side prints. If these two lines disagree for the
+  // same post, the document was written with one url and is being served another; if they agree
+  // and the photo is still wrong, the object behind that url holds the wrong bytes and the fault
+  // is in what was uploaded. Read from the snapshot rather than from the rendered row, so it fires
+  // once per document Firestore delivers.
+  if (__DEV__) {
+    console.log('Feed post media', { mediaUrl: post.mediaUrl ?? '', postId: id });
+  }
+
+  return post;
 }
 
 function PostVideo({
@@ -489,11 +563,54 @@ function PostSoundRow({
   );
 }
 
+/**
+ * Removes a post and the file behind it.
+ *
+ * The document goes first: it is the record of the post, and the feed's listener drops the row
+ * on its own once it is gone. The file is removed afterwards and its failure is swallowed by
+ * removePostMedia, because an orphaned upload is a much smaller problem than a post the owner
+ * asked to have deleted that is still in their feed.
+ */
+async function deletePost(post: Post) {
+  await deleteDoc(doc(getFirebaseDb(), 'posts', post.id));
+
+  const path = storagePathFromUrl(post.mediaUrl);
+
+  if (path) {
+    await removePostMedia(path);
+  }
+}
+
+/**
+ * react-native-web stubs Alert.alert to a no-op, so the browser's own confirm is used there.
+ * Returning a promise keeps the caller identical on both platforms.
+ */
+function confirmDestructive(title: string, message: string) {
+  if (Platform.OS === 'web') {
+    if (typeof window === 'undefined' || typeof window.confirm !== 'function') {
+      return Promise.resolve(false);
+    }
+
+    return Promise.resolve(window.confirm(`${title}\n\n${message}`));
+  }
+
+  return new Promise<boolean>((resolve) => {
+    Alert.alert(title, message, [
+      { onPress: () => resolve(false), style: 'cancel', text: 'Cancel' },
+      {
+        onPress: () => resolve(true),
+        style: 'destructive',
+        text: 'Delete',
+      },
+    ], { cancelable: true, onDismiss: () => resolve(false) });
+  });
+}
+
 export default function Home() {
   const isFocused = useIsFocused();
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
-  const [posts, setPosts] = useState<Post[]>([]);
+  const [feed, setFeed] = useState<{ posts: Post[]; tab: string }>({ posts: [], tab: '' });
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
   // The list is measured instead of trusting the window height, otherwise a header or
@@ -506,12 +623,35 @@ export default function Home() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [isScrolling, setIsScrolling] = useState(false);
   const [selectedTab, setSelectedTab] = useState('Friends');
+
+  // The posts on screen belong to a named tab rather than being a bare list. A tab change starts a
+  // new set of listeners, and until the first of them answers there is nothing honest to show: the
+  // previous tab's posts are the wrong answer, and showing them for a moment is the bug that made
+  // the Public tab look like it was serving restricted posts. Reading the list only when the tag
+  // matches the selected tab is also why nothing has to be cleared in an effect.
+  // Memoised because the derived identity has to be stable: `posts` is a dependency of the comment
+  // count lookup, and a fresh array on every render would make that memo recompute constantly.
+  const posts = useMemo(
+    () => (feed.tab === selectedTab ? feed.posts : EMPTY_FEED),
+    [feed, selectedTab],
+  );
+  // True between picking a tab and its first result, which is the only window where "no posts yet"
+  // would be a lie.
+  const isFeedSettling = feed.tab !== selectedTab;
   // The comment sheet renders over the post instead of navigating away, so the feed keeps
   // its scroll position and the video behind the sheet stays the same one.
   const [commentsPostId, setCommentsPostId] = useState('');
   // One switch for the whole feed, like the sound toggle in a short-video app: tapping the
   // song label silences every post, not just the one on screen.
   const [isSoundMuted, setIsSoundMuted] = useState(false);
+  // Whose feed this is. Read from the auth listener rather than from currentUser at render, so
+  // the owner actions on a post appear or disappear when the account changes instead of
+  // depending on whichever render happened to read a null.
+  const [viewerId, setViewerId] = useState('');
+  // The post whose options sheet is open, or '' when it is closed. Held as an id rather than
+  // the post so a listener update cannot leave a stale copy of the document in the sheet.
+  const [menuPostId, setMenuPostId] = useState('');
+  const [deletingPostId, setDeletingPostId] = useState('');
   const scrollEndTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -532,26 +672,205 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const db = getFirebaseDb();
-    const q = query(collection(db, 'posts'), orderBy('createdAt', 'desc'));
+    let unsubscribe: (() => void) | undefined;
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const postsData = snapshot.docs.map((doc) => toPost(doc.id, doc.data()));
-      setPosts(postsData);
+    try {
+      unsubscribe = onAuthStateChanged(getFirebaseAuth(), (user) => {
+        setViewerId(user?.uid ?? '');
+      });
+    } catch (error) {
+      console.error('Firebase auth is unavailable:', error);
+    }
+
+    return unsubscribe;
+  }, []);
+
+  // The feed, as three queries rather than one.
+  //
+  // A single `collection(posts)` query cannot work with restricted posts: Firestore validates a
+  // query against the read rule for every document it *might* return, so a rule that depends on
+  // `resource.data.userId` or on a per-post audience makes the whole query fail rather than filter
+  // it. Each query below is shaped so one clause of the rule proves it on its own, and the results
+  // are merged here.
+  //
+  //   public         -> proves the "visibility == public" clause
+  //   legacy         -> posts written before the field existed, which the rules also treat as public
+  //   own posts      -> proves the "userId == me" clause
+  //   visibleToUids  -> proves the "me in the audience" clause, via array-contains
+  //
+  // All four are needed: the public query misses your own private posts, the own-posts query
+  // misses everyone else's, and the audience query is what a restricted post from someone you
+  // follow comes back on.
+  useEffect(() => {
+    if (!viewerId) {
+      return undefined;
+    }
+
+    const db = getFirebaseDb();
+    // Merged by id, so a post that matches two of the queries is held once. The map is the
+    // accumulator every listener writes into, which is why it is built once per effect run rather
+    // than per snapshot.
+    // Whether a post arrived on the audience query, which is the only query that can prove its
+    // author follows the viewer. The Friends tab needs that in order to work out a mutual follow.
+    const merged = new Map<string, { fromAudience: boolean; post: Post }>();
+    // Bumped on every publish and on teardown, so a slow readFollow belonging to a tab that is no
+    // longer selected cannot land on top of the tab that replaced it.
+    let publishGeneration = 0;
+
+    // The merged feed is sorted here rather than by the queries' own orderBy, because the queries
+    // come back separately and only this point can produce one correct order. `createdAt` is a
+    // serverTimestamp, so it can still be null for a post written in the same moment it was read,
+    // and those sort to the bottom rather than throwing on `.toMillis()`.
+    const toMillis = (value: Timestamp | Date | null | undefined) => {
+      if (value instanceof Timestamp) {
+        return value.toMillis();
+      }
+      return value instanceof Date ? value.getTime() : 0;
+    };
+
+    const publish = async () => {
+      publishGeneration += 1;
+      const generation = publishGeneration;
+      let entries = [...merged.values()];
+
+      // The Friends tab is the only one that is not a plain query, because a mutual follow cannot be
+      // asked for in one. Both directions come from data this client is allowed to read:
+      //
+      //   they follow me  -> the post came back on the audience query, because the audience written
+      //                      onto it is the author's own following list and the viewer is on it
+      //   I follow them  -> readFollow reads users/{viewerId}/following/{authorId}, the viewer's own
+      //                      subcollection, which the rules let them list
+      //
+      // Requiring both is a real mutual rather than a guess at one. A public post is excluded from
+      // this test: nothing about a public post records whether its author follows the viewer, so it
+      // cannot be shown to be mutual. The viewer's own posts are always kept, so the tab is not
+      // simply empty for someone whose network has posted nothing restricted.
+      if (selectedTab === 'Friends') {
+        const followed = new Map<string, boolean>();
+
+        await Promise.all(
+          entries
+            .filter((entry) => entry.fromAudience && entry.post.userId)
+            .map((entry) => readFollow(viewerId, entry.post.userId).then((isFollowing) => {
+              followed.set(entry.post.userId, isFollowing);
+            })),
+        );
+
+        if (generation !== publishGeneration) {
+          return;
+        }
+
+        entries = entries.filter((entry) => (
+          entry.post.userId === viewerId
+          || (entry.fromAudience && followed.get(entry.post.userId) === true)
+        ));
+      }
+
+      if (generation !== publishGeneration) {
+        return;
+      }
+
+      setFeed({
+        posts: entries
+          .map((entry) => entry.post)
+          .sort((first, second) => toMillis(second.createdAt) - toMillis(first.createdAt)),
+        tab: selectedTab,
+      });
       setErrorMessage('');
       setLoading(false);
-    }, (error) => {
-      console.error('Error fetching posts: ', error);
+    };
+
+    const onError = (label: string) => (error: Error) => {
+      console.error(`Error fetching ${label} posts: `, error);
+      // Firestore's own errors carry a `code` that plain Error does not, which is the only way to
+      // tell "the rules are wrong" apart from "the network is wrong" and say something useful.
+      const code = (error as { code?: string }).code;
       setErrorMessage(
-        error.code === 'permission-denied'
-          ? 'You do not have permission to view posts. Check your Firestore security rules.'
+        code === 'permission-denied'
+          ? 'You do not have permission to view posts. Check your Firestore security rules and redeploy them.'
           : 'Could not load posts. Please try again.',
       );
       setLoading(false);
-    });
+    };
 
-    return () => unsubscribe();
-  }, []);
+    // A post is stored by whichever query found it, and `fromAudience` is OR'd in rather than
+    // overwritten. Without that, a post matching both the public and the audience query would be
+    // relabelled as public-only by whichever listener fired last and drop out of the Friends tab.
+    const listen = (label: string, fromAudience: boolean, q: Query<DocumentData>) => onSnapshot(
+      q,
+      (snapshot) => {
+        snapshot.forEach((postDocument) => {
+          const post = toPost(postDocument.id, postDocument.data());
+          const existing = merged.get(post.id);
+
+          merged.set(post.id, {
+            fromAudience: fromAudience || Boolean(existing?.fromAudience),
+            post,
+          });
+        });
+        // Published on every query rather than only when all of them land, so a slow or denied query
+        // cannot leave the feed stuck on its spinner with nothing in it.
+        void publish();
+      },
+      onError(label),
+    );
+
+    const publicPosts = () => [
+      listen('public', false, query(
+        collection(db, 'posts'),
+        where('visibility', '==', 'public'),
+        orderBy('createdAt', 'desc'),
+        limit(FEED_QUERY_LIMIT),
+      )),
+      // Posts written before visibility existed. Firestore's `==` does not match a missing field,
+      // but `== null` does, so without this every existing post would silently drop out of the feed
+      // the moment the rules were deployed. Delete this query after the posts collection has been
+      // backfilled with `visibility: 'public'`.
+      listen('legacy', false, query(
+        collection(db, 'posts'),
+        where('visibility', '==', null),
+        orderBy('createdAt', 'desc'),
+        limit(FEED_QUERY_LIMIT),
+      )),
+    ];
+
+    // The viewer's own posts, on every tab but Public. Only this query can return an only_me post,
+    // so without it the one person allowed to see their own private post could not see it.
+    const ownPosts = () => listen('own', false, query(
+      collection(db, 'posts'),
+      where('userId', '==', viewerId),
+      orderBy('createdAt', 'desc'),
+      limit(FEED_QUERY_LIMIT),
+    ));
+
+    // Everything the viewer is in the audience of: a restricted post from someone in their network,
+    // and the only query that can prove such an author follows them.
+    const audiencePosts = () => listen('audience', true, query(
+      collection(db, 'posts'),
+      where('visibleToUids', 'array-contains', viewerId),
+      orderBy('createdAt', 'desc'),
+      limit(FEED_QUERY_LIMIT),
+    ));
+
+    // What each tab is allowed to ask for.
+    //
+    // Public is deliberately strict: public posts and nothing else. It is the tab that promises
+    // "anything here is open to everyone", so a followers_friends or only_me post appearing on it
+    // is a leak of intent, not just of data. It carries neither the audience query nor the viewer's
+    // own posts, because a private post of their own would otherwise turn up on the one tab that
+    // means "public". Their own posts live on Follow and Friends instead.
+    //
+    // Live has no live content of its own in the data model yet, so it shows the same public set as
+    // Public rather than quietly serving a restricted post under a tab that promises otherwise.
+    const unsubscribers = selectedTab === 'Public' || selectedTab === 'Live'
+      ? publicPosts()
+      : [...publicPosts(), ownPosts(), audiencePosts()];
+
+    return () => {
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+      publishGeneration += 1;
+    };
+  }, [selectedTab, viewerId]);
 
   // Stable identity: FlatList stores these once and re-runs them if they change.
   const handleViewableItemsChanged = useCallback(
@@ -604,6 +923,67 @@ export default function Home() {
     setIsSoundMuted((current) => !current);
   }, []);
 
+  // The post the options sheet is showing. Looked up in the live list, so a post deleted from
+  // under the sheet cannot be acted on from a copy of itself.
+  const menuPost = useMemo(
+    () => posts.find((post) => post.id === menuPostId) ?? null,
+    [menuPostId, posts],
+  );
+
+  const closeOptions = useCallback(() => {
+    setMenuPostId('');
+  }, []);
+
+  const openOptions = useCallback((postId: string) => {
+    setMenuPostId(postId);
+  }, []);
+
+  const confirmDelete = useCallback(async (post: Post) => {
+    const isConfirmed = await confirmDestructive('Delete post', 'Are you sure you want to delete this post?');
+
+    if (!isConfirmed) {
+      return;
+    }
+
+    setDeletingPostId(post.id);
+    closeOptions();
+
+    try {
+      await deletePost(post);
+    } catch (error) {
+      console.error('Could not delete the post:', error);
+      notify(
+        'Could not delete',
+        isFirestorePermissionError(error)
+          ? 'The Firestore rules do not allow deleting this post.'
+          : 'Please check your connection and try again.',
+      );
+    } finally {
+      // Cleared whatever happened, so a failed delete cannot leave the row stuck as busy.
+      setDeletingPostId('');
+    }
+  }, [closeOptions]);
+
+  // The text, the audience and the photos are passed as params rather than the whole post: the
+  // route param is the only thing that survives being read back on a cold start. The editor still
+  // re-reads the document, because the params are only what the feed happened to be holding.
+  const openEditor = useCallback((post: Post) => {
+    closeOptions();
+
+    router.push({
+      pathname: '/edit-post',
+      params: {
+        description: post.description ?? '',
+        // The editor needs the audience and the full photo set as well as the text. A list rides as
+        // a JSON string because a param can only be a string; the editor parses it back.
+        mediaUrls: JSON.stringify(post.mediaUrls ?? []),
+        postId: post.id,
+        visibility: post.visibility ?? '',
+        title: post.title ?? '',
+      },
+    });
+  }, [closeOptions]);
+
   // The sheet shows the counter the feed keeps on the post, so the header agrees with the
   // number next to the comment icon even when the list below is only the newest page.
   const commentsCount = useMemo(
@@ -619,6 +999,12 @@ export default function Home() {
     // The sheet covers the lower half of the post, so the video pauses while it is open
     // instead of playing behind the comments.
     const isCurrentPost = isFocused && !isScrolling && index === activeIndex && commentsPostId === '';
+    // Only the author gets the options. The uid is the same field the rules key on, so a
+    // forged post claiming someone else's id still only shows this to its real author.
+    const isOwnPost = Boolean(viewerId) && viewerId === item.userId;
+    // Below the tab pill, which is measured rather than guessed, and above the media so the
+    // button reads on a bright frame as well as on the black one.
+    const optionsTop = topBarHeight + 10;
 
     return (
       <View style={[styles.itemContainer, { height: pageHeight }]}>
@@ -626,17 +1012,32 @@ export default function Home() {
             the same way and neither can spill past the page. No padding or margin: the post
             has to reach the edges of the screen. */}
         <View style={styles.media}>
-          {item.mediaType === 'video' ? (
+          {item.mediaType === 'video' && item.mediaUrl ? (
             <PostVideo
               bottomInset={bottomChrome}
               isActive={isCurrentPost}
               isMuted={!isCurrentPost}
-              uri={item.mediaUrl ?? ''}
+              uri={item.mediaUrl}
             />
+          ) : item.mediaUrl ? (
+            // Keyed by the document, not left to position. The list is a merged, client-sorted view
+            // of several live queries, so a document can change row between renders; without a key
+            // React can carry an already-loaded Image over to a different post and leave the
+            // previous photo on screen for a frame.
+            <Image
+              contentFit="contain"
+              key={`${item.id}:${item.mediaUrl}`}
+              source={{ uri: item.mediaUrl }}
+              style={styles.mediaFill}
+            />
+          ) : item.backgroundColor ? (
+            // A text post has no file behind it, so the colour stands in for the media and the
+            // title and description sit on top of it.
+            <View style={[styles.mediaFill, { backgroundColor: item.backgroundColor }]} />
           ) : (
             <Image
               contentFit="contain"
-              source={{ uri: item.mediaUrl || 'https://i.pravatar.cc/150?u=test' }}
+              source={{ uri: 'https://i.pravatar.cc/150?u=test' }}
               style={styles.mediaFill}
             />
           )}
@@ -651,7 +1052,7 @@ export default function Home() {
             onToggleMute={toggleSoundMute}
             sound={item.sound}
           />
-          <PostTitle title={item.title} />
+          <PostTitle isOwnPost={isOwnPost} title={item.title} visibility={item.visibility} />
           <CaptionText
             // A titled post with no description reads as the title alone. "No caption" is only
             // shown when the post has no text of its own to show.
@@ -659,6 +1060,23 @@ export default function Home() {
             placeholder={item.title?.trim() ? null : 'No caption'}
           />
         </View>
+
+        {isOwnPost ? (
+          <Pressable
+            accessibilityLabel="Post options"
+            accessibilityRole="button"
+            disabled={deletingPostId === item.id}
+            hitSlop={8}
+            onPress={() => openOptions(item.id)}
+            style={[styles.postOptionsButton, { top: optionsTop }]}
+          >
+            {deletingPostId === item.id ? (
+              <ActivityIndicator color="#FFFFFF" size="small" />
+            ) : (
+              <Ionicons color="#FFFFFF" name="ellipsis-horizontal" size={20} />
+            )}
+          </Pressable>
+        ) : null}
 
         <SocialActions
           bottomInset={bottomChrome}
@@ -695,6 +1113,13 @@ export default function Home() {
         // Measured, not guessed: the explore view starts under the bar whatever the status bar
         // inset and the pill height come to on the device.
         <ExploreContent topInset={topBarHeight + 12} />
+      ) : isFeedSettling ? (
+        // Between choosing a tab and its first result. Deliberately a spinner rather than the
+        // empty state: there is no answer yet, and "No posts yet" on a tab that simply has not
+        // loaded is the same class of lie as showing the previous tab's posts here.
+        <View style={styles.emptyContainer}>
+          <ActivityIndicator color="#FFFFFF" />
+        </View>
       ) : posts.length === 0 ? (
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyText}>No posts yet.</Text>
@@ -739,6 +1164,22 @@ export default function Home() {
         </Pressable>
       </View>
 
+      <PostOptionsSheet
+        isDeleting={deletingPostId !== ''}
+        onClose={closeOptions}
+        onDelete={() => {
+          if (menuPost) {
+            void confirmDelete(menuPost);
+          }
+        }}
+        onEdit={() => {
+          if (menuPost) {
+            openEditor(menuPost);
+          }
+        }}
+        post={menuPost}
+      />
+
       <CommentSheet
         onClose={closeComments}
         postId={commentsPostId}
@@ -749,22 +1190,127 @@ export default function Home() {
   );
 }
 
+// The two owner actions, as a sheet over the feed rather than the platform ActionSheet: the feed
+// already draws its own overlays this way, so the options look like part of the app on both
+// platforms instead of dropping a different-looking dialog on top of the video.
+function PostOptionsSheet({
+  isDeleting,
+  onClose,
+  onDelete,
+  onEdit,
+  post,
+}: {
+  isDeleting: boolean;
+  onClose: () => void;
+  onDelete: () => void;
+  onEdit: () => void;
+  post: Post | null;
+}) {
+  const insets = useSafeAreaInsets();
+
+  return (
+    <Modal
+      animationType="slide"
+      onRequestClose={onClose}
+      statusBarTranslucent
+      transparent
+      visible={post !== null}
+    >
+      <View style={styles.optionsRoot}>
+        {/* Tapping the dimmed post behind dismisses without picking an action. */}
+        <Pressable accessibilityLabel="Close options" onPress={onClose} style={styles.optionsBackdrop} />
+
+        <View style={[styles.optionsSheet, { paddingBottom: Math.max(insets.bottom, 14) }]}>
+          <View style={styles.optionsHandle} />
+
+          {post ? (
+            <>
+              <Pressable
+                accessibilityLabel="Edit post"
+                accessibilityRole="button"
+                disabled={isDeleting}
+                onPress={onEdit}
+                style={({ pressed }) => [styles.optionsRow, pressed && styles.optionsRowPressed]}
+              >
+                <Ionicons color="#FFFFFF" name="create-outline" size={21} />
+                <Text style={styles.optionsLabel}>Edit Post</Text>
+              </Pressable>
+
+              <View style={styles.optionsDivider} />
+
+              <Pressable
+                accessibilityLabel="Delete post"
+                accessibilityRole="button"
+                disabled={isDeleting}
+                onPress={onDelete}
+                style={({ pressed }) => [styles.optionsRow, pressed && styles.optionsRowPressed]}
+              >
+                {isDeleting ? (
+                  <ActivityIndicator color="#FF6B6B" size="small" />
+                ) : (
+                  <Ionicons color="#FF6B6B" name="trash-outline" size={21} />
+                )}
+                <Text style={[styles.optionsLabel, styles.optionsLabelDanger]}>Delete Post</Text>
+              </Pressable>
+            </>
+          ) : null}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 // Splits on #tags so they can be tinted without pulling in a markdown style parser.
 const HASHTAG_PATTERN = /(#[\wÀ-ɏ]+)/g;
 
+// The icon that stands for an audience, beside the title. Public posts show nothing: a globe on
+// every post would be noise, and the absence of a lock is the normal case.
+const VISIBILITY_ICONS: Record<string, { icon: keyof typeof Ionicons.glyphMap; label: string }> = {
+  followers_friends: { icon: 'people-outline', label: 'Followers and Friends' },
+  friends_only: { icon: 'people-outline', label: 'Friends Only' },
+  only_me: { icon: 'lock-closed-outline', label: 'Only Me' },
+};
+
 // The headline from the details screen. One line only: the description underneath it has room for
 // the rest, and a second clipped line of title just pushes the caption off the bottom.
-function PostTitle({ title }: { title?: string }) {
+function PostTitle({ isOwnPost, title, visibility }: {
+  isOwnPost: boolean;
+  title?: string;
+  visibility?: string;
+}) {
   const text = title?.trim();
+  // Only on the author's own posts. Everyone who can see a post is already by definition in its
+  // audience, so a marker on other people's posts tells the reader nothing they did not already
+  // know, and on a feed of other people it is clutter.
+  const marker = isOwnPost && visibility ? VISIBILITY_ICONS[visibility] : undefined;
 
   if (!text) {
-    return null;
+    // The audience still has to be visible on an untitled post, or a private photo with no caption
+    // would look exactly like a public one.
+    return marker ? (
+      <View style={styles.postTitleOnly}>
+        <Ionicons color="rgba(255, 255, 255, 0.85)" name={marker.icon} size={13} />
+        <Text style={styles.postTitleMarked}>{marker.label}</Text>
+      </View>
+    ) : null;
   }
 
   return (
-    <Text numberOfLines={2} style={styles.postTitle}>
-      {text}
-    </Text>
+    <View style={styles.postTitleRow}>
+      <Text numberOfLines={2} style={styles.postTitle}>
+        {text}
+      </Text>
+
+      {marker ? (
+        <Ionicons
+          accessibilityLabel={`Visible to ${marker.label}`}
+          color="rgba(255, 255, 255, 0.85)"
+          name={marker.icon}
+          size={13}
+          style={styles.postTitleIcon}
+        />
+      ) : null}
+    </View>
   );
 }
 
@@ -827,6 +1373,15 @@ const SOCIAL_BAR_HEIGHT = 64;
 // Both flags live in one document at posts/{postId}/reactions/{userId}, so the viewer only
 // needs a single listener per post and a like and a love never fight over separate files.
 const REACTIONS_COLLECTION = 'reactions';
+
+// How many posts each of the feed's queries asks for. The feed is a paged vertical list, so a few
+// screens' worth is enough; a larger number here means a larger composite index and a slower first
+// paint for no visible gain.
+const FEED_QUERY_LIMIT = 30;
+
+// Stands in for "this tab has no results yet" so the derived list keeps a stable identity instead of
+// being a fresh empty array on every render.
+const EMPTY_FEED: Post[] = [];
 
 interface ReactionFlags {
   liked?: boolean;
@@ -1425,7 +1980,14 @@ const styles = StyleSheet.create({
   // height and the phone inset are only known on the device.
   overlay: { position: 'absolute', left: 16, right: 16, marginBottom: 10 },
   // Heavier than the description under it, so the headline reads first at a glance.
-  postTitle: { color: '#FFFFFF', fontSize: 16, fontWeight: '700', lineHeight: 21, marginBottom: 4 },
+  postTitle: { color: '#FFFFFF', flex: 1, fontSize: 16, fontWeight: '700', lineHeight: 21 },
+  // The title and the audience icon on one line, so the icon sits on the title's baseline rather
+  // than adding a row of its own to the overlay above the caption.
+  postTitleRow: { alignItems: 'center', flexDirection: 'row', gap: 6, marginBottom: 4 },
+  postTitleIcon: { marginTop: 1 },
+  // An untitled post that is still restricted shows the audience on its own, in the title's place.
+  postTitleOnly: { alignItems: 'center', flexDirection: 'row', gap: 6, marginBottom: 4 },
+  postTitleMarked: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
   caption: { color: '#FFFFFF', fontSize: 14, lineHeight: 19 },
   soundLabel: {
     alignItems: 'center',
@@ -1645,5 +2207,71 @@ const styles = StyleSheet.create({
   socialCount: {
     color: '#FFFFFF',
     fontSize: 12,
+  },
+  // The owner menu, hard right just under the tab pill. Absolute because it sits on the media,
+  // not in a row: a row of chrome on top of a full page photo would need its own background and
+  // would cover the picture. One number under an absolute fill box, so the feed keeps its height.
+  postOptionsButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    borderRadius: 999,
+    height: 36,
+    justifyContent: 'center',
+    position: 'absolute',
+    right: 12,
+    width: 36,
+    // Under the top bar, which carries its own zIndex, so the pill always sits on the post.
+    zIndex: 9,
+  },
+  optionsRoot: {
+    flex: 1,
+    justifyContent: 'flex-end',
+  },
+  optionsBackdrop: {
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    flex: 1,
+  },
+  // The same dark fill as the music sheet, so the two overlays belong to one surface. Solid, not
+  // translucent: nothing of the post needs to show through a menu.
+  optionsSheet: {
+    backgroundColor: '#111827',
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    overflow: 'hidden',
+    paddingHorizontal: 8,
+    paddingTop: 8,
+  },
+  optionsHandle: {
+    alignSelf: 'center',
+    backgroundColor: '#4B5563',
+    borderRadius: 2,
+    height: 4,
+    marginBottom: 8,
+    width: 40,
+  },
+  optionsRow: {
+    alignItems: 'center',
+    borderRadius: 12,
+    flexDirection: 'row',
+    gap: 14,
+    minHeight: 56,
+    paddingHorizontal: 12,
+  },
+  optionsRowPressed: {
+    backgroundColor: '#1F2937',
+  },
+  optionsDivider: {
+    backgroundColor: '#1F2937',
+    height: StyleSheet.hairlineWidth,
+    marginHorizontal: 12,
+  },
+  optionsLabel: {
+    color: '#FFFFFF',
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  optionsLabelDanger: {
+    color: '#FF6B6B',
   },
 });

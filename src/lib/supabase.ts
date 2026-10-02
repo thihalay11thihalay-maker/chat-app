@@ -96,6 +96,42 @@ export async function removePostMedia(mediaPath: string) {
   }
 }
 
+/**
+ * The object path inside the storage bucket for a stored media url.
+ *
+ * A public url looks like `<project>/storage/v1/object/public/<bucket>/<path>`, but the path is
+ * written two ways in this app: flat at the bucket root by the upload flow, and under
+ * `posts/<uid>/` by the media helper above. Everything from the bucket segment onwards is the path
+ * Supabase's remove() expects, whichever prefix produced it. An unrecognised url returns an empty
+ * string, so nothing is ever asked to remove a path guessed out of thin air.
+ *
+ * Lives here rather than on the feed because two screens delete media now, and two copies of a
+ * parser that decides which object to destroy is exactly the kind of thing that drifts.
+ */
+export function storagePathFromUrl(url?: string): string {
+  const trimmed = url?.trim();
+
+  if (!trimmed) {
+    return '';
+  }
+
+  const segments = trimmed.split('?')[0].split('/').filter(Boolean);
+  // The bucket segment is looked for after `public`, so a folder that happens to share the
+  // bucket's name earlier in the path cannot be mistaken for it.
+  const publicIndex = segments.indexOf('public');
+  const searchFrom = publicIndex === -1 ? 0 : publicIndex;
+  const bucketIndex = segments.indexOf(supabaseBucket, searchFrom);
+
+  if (bucketIndex === -1) {
+    return '';
+  }
+
+  return segments
+    .slice(bucketIndex + 1)
+    .map((segment) => decodeURIComponent(segment))
+    .join('/');
+}
+
 export function getSupabaseUploadErrorMessage(error: unknown) {
   const details = typeof error === 'object' && error !== null
     ? error as { code?: unknown; message?: unknown; status?: unknown; statusCode?: unknown }

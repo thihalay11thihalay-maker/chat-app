@@ -9,6 +9,15 @@ export type MockChat = {
   unread: number;
   online: boolean;
   kind: 'direct' | 'group';
+  /**
+   * Whether this person is a friend, as opposed to merely someone you have a thread with. Absent on
+   * a group, which has no single person to be friends with.
+   *
+   * This is a separate flag from `online` on purpose. The inbox used to treat "friend" as "direct
+   * chat with someone currently online", which made the two filters the same list and meant
+   * unfollowing somebody or their going offline silently moved them between tabs.
+   */
+  isFriend?: boolean;
   age?: number;
   gender?: 'male' | 'female';
   distance?: string;
@@ -39,6 +48,7 @@ export const MOCK_CHATS: MockChat[] = [
     distance: '3 km away',
     gender: 'female',
     id: 'mock-1',
+    isFriend: true,
     kind: 'direct',
     messages: [
       message('mock-1-m1', 'mock-1', 'Hey! Are you free this evening?', 24),
@@ -57,6 +67,7 @@ export const MOCK_CHATS: MockChat[] = [
     distance: '1.2 km away',
     gender: 'female',
     id: 'mock-2',
+    isFriend: true,
     kind: 'direct',
     messages: [
       message('mock-2-m1', ME, 'Did you get the photos I sent?', 140),
@@ -89,6 +100,7 @@ export const MOCK_CHATS: MockChat[] = [
     distance: '8 km away',
     gender: 'male',
     id: 'mock-4',
+    isFriend: false,
     kind: 'direct',
     messages: [
       message('mock-4-m1', 'mock-4', 'That sounds good to me 👍', 118),
@@ -118,6 +130,7 @@ export const MOCK_CHATS: MockChat[] = [
     distance: '450 m away',
     gender: 'female',
     id: 'mock-6',
+    isFriend: true,
     kind: 'direct',
     messages: [
       message('mock-6-m1', 'mock-6', 'Haha, okay you win', 900),

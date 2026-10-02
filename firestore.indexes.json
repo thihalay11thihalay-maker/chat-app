@@ -1,0 +1,33 @@
+{
+  "//": "Composite indexes for the feed. Firestore will serve each of the feed's four queries from a single-field index only if the filter and the order are on the same field, which none of them are: the home feed filters on visibility, userId or visibleToUids and orders by createdAt. Without these the listeners fail with FAILED_PRECONDITION / 'The query requires an index'. Deploy with: firebase deploy --only firestore:indexes",
+  "indexes": [
+    {
+      "//": "Public posts, newest first. Also serves the legacy query: Firestore's `== null` matches a missing field, and a null filter with an order on a different field needs its own index.",
+      "collectionGroup": "posts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "//": "Your own posts, newest first. Needed whichever way round the two fields are combined.",
+      "collectionGroup": "posts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "//": "Restricted posts you are in the audience of, newest first.",
+      "collectionGroup": "posts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "visibleToUids", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

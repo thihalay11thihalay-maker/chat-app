@@ -5,6 +5,7 @@ import {
   FlatList,
   Image,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -13,29 +14,59 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { MockChat, MOCK_CHATS } from '@/lib/mock-chats';
 
-type FilterKey = 'All' | 'Friends' | 'Group Chats';
+type FilterKey = 'All' | 'Friends' | 'Group Chats' | 'Online' | 'Offline';
 
-const FILTERS: FilterKey[] = ['All', 'Friends', 'Group Chats'];
+const FILTERS: FilterKey[] = ['All', 'Friends', 'Group Chats', 'Online', 'Offline'];
 
+/**
+ * The list a filter leaves behind.
+ *
+ * Every filter except All and Group Chats is about a *person*, so groups drop out of them. A group
+ * is not online and is not friends with anyone; counting it as either would put a group under a
+ * green dot and under a tab it does not belong to. A group belongs to All and to Group Chats, and
+ * that is the whole of its membership.
+ */
 function filterChats(chats: MockChat[], filter: FilterKey) {
-  if (filter === 'Friends') {
-    return chats.filter((chat) => chat.kind === 'direct' && chat.online);
+  if (filter === 'All') {
+    return chats;
   }
 
   if (filter === 'Group Chats') {
     return chats.filter((chat) => chat.kind === 'group');
   }
 
-  return chats;
+  const people = chats.filter((chat) => chat.kind === 'direct');
+
+  if (filter === 'Friends') {
+    return people.filter((chat) => chat.isFriend);
+  }
+
+  if (filter === 'Online') {
+    return people.filter((chat) => chat.online);
+  }
+
+  return people.filter((chat) => !chat.online);
 }
+
+/** What a filtered list that came out empty should say, so a tap does not look like a dead screen. */
+const EMPTY_MESSAGE: Record<FilterKey, string> = {
+  All: 'No conversations yet.',
+  Friends: 'No chats with friends yet.',
+  'Group Chats': 'You have not joined any group chats.',
+  Online: 'Nobody is online right now.',
+  Offline: 'Everyone is online right now.',
+};
 
 function ChatRow({ chat }: { chat: MockChat }) {
   const genderIcon = chat.gender === 'female' ? 'female' : 'male';
   const genderColor = chat.gender === 'female' ? '#F06292' : '#4FA3E3';
+  // Only a person has a presence. A group row gets no dot, green or grey, because a group is never
+  // online and drawing one would be a claim about something that has no such state.
+  const showsPresence = chat.kind === 'direct' && chat.online;
 
   return (
     <Pressable
-      accessibilityLabel={`Chat with ${chat.name}${chat.unread > 0 ? `, ${chat.unread} unread` : ''}`}
+      accessibilityLabel={`Chat with ${chat.name}${chat.online && chat.kind === 'direct' ? ', online' : ''}${chat.unread > 0 ? `, ${chat.unread} unread` : ''}`}
       accessibilityRole="button"
       // This is the conversation, not discovery. The id is the row's own, so it lands on the
       // thread for the person whose name is on screen.
@@ -44,6 +75,10 @@ function ChatRow({ chat }: { chat: MockChat }) {
     >
       <View style={styles.avatarWrap}>
         <Image source={{ uri: chat.avatar }} style={styles.avatar} />
+
+        {/* Bottom right, the corner a presence badge belongs in, and ringed in the row's own
+            background so it reads as sitting on the photo rather than under it. */}
+        {showsPresence ? <View style={styles.presenceDot} /> : null}
 
         {chat.unread > 0 ? (
           <View style={styles.unreadBadge}>
@@ -67,7 +102,6 @@ function ChatRow({ chat }: { chat: MockChat }) {
         </View>
 
         <View style={styles.snippetLine}>
-          {chat.online ? <View style={styles.onlineDot} /> : null}
           <Text numberOfLines={1} style={styles.snippet}>{chat.snippet}</Text>
         </View>
       </View>
@@ -111,7 +145,16 @@ export default function ChatListScreen() {
         </View>
       </View>
 
-      <View style={styles.filterBar}>
+      {/* Five tabs do not fit a phone width, so the row scrolls sideways instead of squeezing the
+          labels until they truncate. A horizontal ScrollView needs the content to grow on one
+          axis, hence the inner row. */}
+      <ScrollView
+        contentContainerStyle={styles.filterBarContent}
+        horizontal
+        keyboardShouldPersistTaps="handled"
+        showsHorizontalScrollIndicator={false}
+        style={styles.filterBar}
+      >
         {FILTERS.map((option) => {
           const isActive = option === filter;
 
@@ -120,6 +163,7 @@ export default function ChatListScreen() {
               key={option}
               accessibilityLabel={`${option} chats`}
               accessibilityRole="button"
+              accessibilityState={{ selected: isActive }}
               onPress={() => setFilter(option)}
               style={[styles.filterTab, isActive && styles.filterTabActive]}
             >
@@ -127,13 +171,19 @@ export default function ChatListScreen() {
             </Pressable>
           );
         })}
-      </View>
+      </ScrollView>
 
       <FlatList
         contentContainerStyle={styles.list}
         data={visibleChats}
         initialNumToRender={8}
         keyExtractor={(item) => item.id}
+        ListEmptyComponent={
+          <View style={styles.empty}>
+            <Ionicons color="#A2A7B0" name="chatbubbles-outline" size={26} />
+            <Text style={styles.emptyText}>{EMPTY_MESSAGE[filter]}</Text>
+          </View>
+        }
         renderItem={({ item }) => <ChatRow chat={item} />}
         showsVerticalScrollIndicator={false}
       />
@@ -178,8 +228,10 @@ const styles = StyleSheet.create({
   filterBar: {
     borderBottomColor: '#E3DED5',
     borderBottomWidth: StyleSheet.hairlineWidth,
-    flexDirection: 'row',
     marginTop: 12,
+  },
+  filterBarContent: {
+    alignItems: 'center',
     paddingHorizontal: 16,
   },
   filterTab: {
@@ -288,11 +340,31 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 6,
   },
-  onlineDot: {
+  presenceDot: {
     backgroundColor: '#2FBF71',
-    borderRadius: 3,
-    height: 6,
-    width: 6,
+    borderColor: '#F7F4EF',
+    borderRadius: 7,
+    borderWidth: 2,
+    bottom: 0,
+    height: 14,
+    position: 'absolute',
+    right: 0,
+    width: 14,
+  },
+  empty: {
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 32,
+    // Sits high enough to be under the header band rather than stranded at the bottom of a tall
+    // screen, but clears the floating tab bar.
+    paddingTop: 56,
+    paddingBottom: 140,
+  },
+  emptyText: {
+    color: '#8D929C',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
   },
   snippet: {
     color: '#656A73',

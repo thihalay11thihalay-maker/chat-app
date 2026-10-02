@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
+import { CaptureProvider } from '@/components/capture-provider';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
 
@@ -17,7 +18,11 @@ export default function RootLayout() {
     // root. Cheap to keep, and removing it risks breaking navigation gestures.
     <GestureHandlerRootView style={styles.root}>
       <ErrorBoundary>
-        <RootNavigator />
+        {/* Above the navigator so a capture survives navigating from the camera to the story
+            editor and on to the details screen. */}
+        <CaptureProvider>
+          <RootNavigator />
+        </CaptureProvider>
       </ErrorBoundary>
     </GestureHandlerRootView>
   );

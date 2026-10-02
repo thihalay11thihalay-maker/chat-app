@@ -54,34 +54,123 @@ service cloud.firestore {
       }
     }
 
+    // A comment or a reaction lives under a post, so reading one is really reading the post it
+    // hangs off. Without this a private post's comments and reaction flags stay open to anyone who
+    // knows the post id, which is a quieter version of the same leak the post rules just closed.
+    function canReadPost(postId) {
+      let post = get(/databases/$(database)/documents/posts/$(postId)).data;
+
+      return (!('visibility' in post) || post.visibility == 'public')
+        || (
+          isSignedIn()
+          && (
+            post.userId == request.auth.uid
+            // The membership test is guarded rather than relying on the public branch above
+            // short-circuiting past it: reading a field that is not there is a rule error, and a
+            // rule that errors is a rule that denies.
+            || ('visibleToUids' in post && request.auth.uid in post.visibleToUids)
+          )
+        );
+    }
+
     // ---------------------------------------------------------------- posts
+    //
+    // Reading a post is governed by two fields written together at post time:
+    //
+    //   visibility      - public | followers_friends | friends_only | only_me
+    //   visibleToUids   - the accounts allowed to read it, snapshotted from the author's follow
+    //                     list when it was published
+    //
+    // The audience is denormalised onto the document on purpose. Firestore refuses any collection
+    // query whose rule depends on the individual document, so a rule phrased as "readable if you
+    // follow the author" can protect a `get` but can never let a feed query through at all. With
+    // the audience in an array the check becomes an `in` on a field the query can filter on, which
+    // Firestore can validate. See buildAudience() in src/lib/upload-post.ts for what the list is
+    // and what the snapshot costs.
+    //
+    // The trade-off to keep in mind when changing this: `visibleToUids` is frozen at publish time,
+    // so a new follower does not gain older restricted posts. Making that live needs a trusted
+    // server maintaining the list.
     match /posts/{postId} {
-      allow get, list: if isSignedIn();
-      allow create: if isSignedIn();
-      allow update, delete: if isSignedIn();
+      // A post with no visibility field predates this feature and is treated as public, which is
+      // what it was. Same for an audience that is missing on an older restricted post.
+      function hasVisibility() {
+        return 'visibility' in resource.data;
+      }
+
+      function isPublic() {
+        return !hasVisibility() || resource.data.visibility == 'public';
+      }
+
+      function isAuthor() {
+        return isSignedIn() && resource.data.userId == request.auth.uid;
+      }
+
+      function isInAudience() {
+        return isSignedIn()
+          && 'visibleToUids' in resource.data
+          && request.auth.uid in resource.data.visibleToUids;
+      }
+
+      // Readable when public, always your own, or explicitly in the audience. Written as three
+      // separate disjuncts rather than one combined condition because the feed validates each of
+      // its queries against this: a `visibility == 'public'` query must be provable from the first
+      // clause alone, and collapsing them together would make every clause unprovable.
+      allow get, list: if isPublic() || isAuthor() || isInAudience();
+
+      // A caller cannot invent an audience, and cannot write a visibility the app does not know.
+      // Checked on the value being written rather than the stored one.
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && (
+          !('visibility' in request.resource.data)
+          || request.resource.data.visibility in ['public', 'followers_friends', 'friends_only', 'only_me']
+        )
+        && (
+          !('visibleToUids' in request.resource.data)
+          || request.resource.data.visibleToUids is list
+        );
+
+      // Update is no longer open to any signed-in user. It used to be, because the share counter
+      // is written on every post including other people's, but that left anyone able to rewrite
+      // `userId` and `visibility` on a post they do not own, which would have made the read rules
+      // above decorative. So an update is either the author's, or a counter-only write from anyone
+      // whose changed fields are all counters.
+      allow update: if isAuthor()
+        || (
+          isSignedIn()
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['shareCount', 'sharesCount', 'likesCount', 'lovesCount', 'commentsCount'])
+        );
+
+      // Deleting is the author's alone, so the rule enforces what the feed's options menu
+      // already hides behind the owner check. Requires a redeploy of these rules.
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
 
       // One document per reacting user, holding both the liked and loved flags. The feed
       // counts these documents with a collection listener instead of keeping a counter on
       // the post, so the numbers can never drift from the reactions themselves.
       //
-      // list is deliberately not scoped to the owner: Firestore denies a collection query
-      // unless the rule allows it for every document, so scoping it to userId would break
-      // counting. Read access is therefore open to any signed-in user, which is the same
-      // information the published count already implies.
+      // list is deliberately not scoped to the owner, but it is scoped to the post being readable:
+      // Firestore denies a collection query unless the rule allows it for every document, so
+      // counting reactions has to be possible for anyone who can see the post. Read access is
+      // therefore no wider than the post's own audience, which is the same information the
+      // published count already implies.
       match /reactions/{userId} {
         allow get: if isSignedIn() && request.auth.uid == userId;
-        allow list: if isSignedIn();
+        allow list: if isSignedIn() && canReadPost(postId);
         allow create, update: if isSignedIn() && request.auth.uid == userId;
         allow delete: if isSignedIn() && request.auth.uid == userId;
       }
 
-      // Comments are read by every signed-in user and written as their own author, the same
-      // split the reactions subcollection uses. A comment document is immutable once written,
+      // Comments are read by everyone who can read the post, and written as their own author, the
+      // same split the reactions subcollection uses. A comment document is immutable once written,
       // so a reply cannot be made to impersonate somebody else.
       match /comments/{commentId} {
-        allow get, list: if isSignedIn();
+        allow get, list: if isSignedIn() && canReadPost(postId);
 
         allow create: if isSignedIn()
+          && canReadPost(postId)
           && request.resource.data.userId == request.auth.uid
           && request.resource.data.text is string
           && request.resource.data.text.size() > 0

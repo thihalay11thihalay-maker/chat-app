@@ -30,6 +30,7 @@ import { ChatMessage, MessageBubble } from '@/components/chat-message-bubble';
 import { useChatMedia } from '@/hooks/use-chat-media';
 
 import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
+import { CallType } from '@/lib/agora-call';
 import { findMockChat } from '@/lib/mock-chats';
 
 export default function ChatDetailScreen() {
@@ -59,8 +60,14 @@ export default function ChatDetailScreen() {
   } = useChatMedia(chatId, currentUser);
   const isBusy = isSending || isUploading;
 
-  const openCall = () => {
-    router.push(`/call/${encodeURIComponent(chatId)}` as never);
+  // The object form so the call type travels as a real param rather than a fragment of the path.
+  // router encodes the params itself, so chatId is passed raw: encoding it here as well would
+  // encode the percent signs twice and the call screen would decode the wrong id.
+  const openCall = (callType: CallType) => {
+    router.push({
+      params: { callType, id: chatId },
+      pathname: '/call/[id]',
+    } as never);
   };
 
   useEffect(() => {
@@ -144,7 +151,7 @@ export default function ChatDetailScreen() {
             <Pressable
               accessibilityLabel="Start phone call"
               accessibilityRole="button"
-              onPress={openCall}
+              onPress={() => openCall('audio')}
               style={({ pressed }) => [styles.headerAction, pressed && styles.pressed]}
             >
               {/* Ionicons rather than SymbolView: expo-symbols renders through the Material
@@ -155,7 +162,7 @@ export default function ChatDetailScreen() {
             <Pressable
               accessibilityLabel="Start video call"
               accessibilityRole="button"
-              onPress={openCall}
+              onPress={() => openCall('video')}
               style={({ pressed }) => [styles.headerAction, pressed && styles.pressed]}
             >
               <Ionicons color="#FFFFFF" name="videocam-outline" size={20} />

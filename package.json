@@ -10,6 +10,7 @@
     "@react-native-community/datetimepicker": "9.1.0",
     "@react-native-community/slider": "5.2.0",
     "@react-navigation/native": "^7.4.1",
+    "@shopify/react-native-skia": "2.6.2",
     "@supabase/supabase-js": "^2.117.2",
     "base64-arraybuffer": "^1.0.2",
     "expo": "~57.0.25",
@@ -61,5 +62,11 @@
     "web": "expo start --web",
     "lint": "expo lint"
   },
-  "private": true
+  "private": true,
+  "allowScripts": {
+    "@firebase/util@1.15.3": true,
+    "@shopify/react-native-skia@2.6.2": true,
+    "protobufjs@7.6.6": true,
+    "unrs-resolver@1.12.2": true
+  }
 }

@@ -11,7 +11,9 @@
       "icon": "./assets/expo.icon",
       "infoPlist": {
         "NSCameraUsageDescription": "Allow Convo to use your camera for video calls.",
-        "NSMicrophoneUsageDescription": "Allow Convo to use your microphone for calls and audio messages."
+        "NSMicrophoneUsageDescription": "Allow Convo to use your microphone for calls and audio messages.",
+        "NSPhotoLibraryUsageDescription": "Allow Convo to show the photos and videos you saved from your chats.",
+        "NSPhotoLibraryAddUsageDescription": "Allow Convo to save photos and videos from your chats to your gallery."
       }
     },
     "android": {
@@ -64,6 +66,21 @@
           "recordAudioAndroid": true,
           "barcodeScannerEnabled": false
         }
+      ],
+      "expo-image",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Convo to show the photos and videos you saved from your chats.",
+          "savePhotosPermission": "Allow Convo to save photos and videos from your chats to your gallery.",
+          "isAccessMediaLocationEnabled": false
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Allow Convo to find which of your contacts already use Convo, so you can add them as friends. Your contacts stay on your phone."
+        }
       ]
     ],
     "experiments": {
@@ -74,6 +91,11 @@
       "router": {},
       "eas": {
         "projectId": "3c002a89-f0aa-4330-921a-dbc975e03b3b"
+      },
+      "featureFlags": {
+        "findFriendsTab": false,
+        "liveTab": false,
+        "chatCalls": false
       }
     }
   }

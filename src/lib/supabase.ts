@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { File } from 'expo-file-system';
 import { Platform } from 'react-native';
 
 const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL ?? '';
@@ -51,22 +52,42 @@ export type UploadedMedia = {
   storageBucket: string;
 };
 
-async function buildStorageUploadBody(file: UploadableFile): Promise<Blob | FormData> {
+/**
+ * The bytes of a picked file, in the one body shape that works everywhere.
+ *
+ * Nothing multipart is built here on purpose. Expo's fetch is a native network stack, and when it
+ * writes a FormData it can only encode three kinds of part: a string, a Blob, or an object that can
+ * hand over its own bytes. React Native's own file part -- the `{ uri, name, type }` object that used
+ * to be appended here -- is none of those, so it is refused with "Unsupported FormDataPart
+ * implementation" before a request is ever sent. The same rejection applies to a Blob on native,
+ * which is why the whole multipart route is gone rather than the `{ uri }` part alone.
+ *
+ * Raw bytes plus an explicit content type is what Supabase documents for React Native, and it is
+ * also what its client does with anything that is not a Blob or a FormData: it posts the body as it
+ * is and writes `options.contentType` as the request's own Content-Type header. That is why every
+ * caller has to pass the content type in rather than leave it on a part header that will never be
+ * written -- without it the object is stored as text/plain.
+ *
+ * Exported because more than one screen uploads now.
+ */
+export async function buildStorageUploadBody(file: UploadableFile): Promise<Uint8Array> {
   if (Platform.OS === 'web') {
     const response = await fetch(file.uri);
     if (!response.ok) {
       throw new Error('Could not read the selected file.');
     }
-    return await response.blob();
+    return new Uint8Array(await response.arrayBuffer());
   }
 
-  const formData = new FormData();
-  formData.append('file', {
-    name: file.fileName,
-    type: file.contentType,
-    uri: file.uri,
-  } as unknown as Blob);
-  return formData;
+  try {
+    // expo-file-system reads the picked file straight off the disk into a typed array, with no
+    // base64 round trip in between and without depending on the network stack being able to open
+    // the uri itself.
+    return await new File(file.uri).bytes();
+  } catch (error) {
+    console.warn('Could not read the picked file:', error);
+    throw new Error('Could not read the selected file.');
+  }
 }
 
 export async function uploadPostMedia(uid: string, file: UploadableFile): Promise<UploadedMedia> {
@@ -75,7 +96,13 @@ export async function uploadPostMedia(uid: string, file: UploadableFile): Promis
   const mediaPath = `posts/${uid}/${Date.now()}_${safeName}`;
 
   const body = await buildStorageUploadBody(file);
-  const { error } = await storage.upload(mediaPath, body, { cacheControl: '3600', upsert: false });
+  const { error } = await storage.upload(mediaPath, body, {
+    cacheControl: '3600',
+    // Required for a byte body: this is the header Supabase writes for it, and the object is
+    // stored as text/plain when it is left out.
+    contentType: file.contentType,
+    upsert: false,
+  });
   if (error) {
     throw error;
   }

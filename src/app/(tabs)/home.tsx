@@ -4,7 +4,7 @@ import { router, useIsFocused } from 'expo-router';
 import { Image } from 'expo-image';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { onAuthStateChanged } from 'firebase/auth';
-import { collection, deleteDoc, doc, getDoc, limit, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp, where, type DocumentData, type Query } from 'firebase/firestore';
+import { collection, deleteDoc, doc, limit, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp, where, type DocumentData, type Query } from 'firebase/firestore';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -29,36 +29,10 @@ import { CommentSheet } from '@/components/comment-sheet';
 import { TAB_BAR_HEIGHT } from '@/components/curved-tab-bar';
 import { ExploreContent } from '@/components/explore-content';
 import { getFirebaseAuth, getFirebaseDb, isFirestorePermissionError } from '@/lib/firebase';
-import { PostSound, resolveStreamUrl, toPostSoundValue } from '@/lib/music';
+import { readFollow, setFollowing } from '@/lib/follow';
+import { PostSound, resolveStreamUrl } from '@/lib/music';
+import { Post, toPost } from '@/lib/post';
 import { removePostMedia, storagePathFromUrl } from '@/lib/supabase';
-
-interface Post {
-  id: string;
-  /** Flat colour standing in for the media on a text post. */
-  backgroundColor?: string;
-  displayName?: string;
-  mediaType?: 'image' | 'video';
-  mediaUrl?: string;
-  /**
-   * Every photo on the post. `mediaUrl` stays the cover the feed draws, so this is the full set
-   * behind it. A post written before the editor existed has no array, so it reads as the cover
-   * alone rather than as an empty post.
-   */
-  mediaUrls?: string[];
-  /** Who the post is published to. Public when absent, which is how every post behaved before. */
-  visibility?: string;
-  caption?: string;
-  /** Longer form text from the post details screen, shown under the title. */
-  description?: string;
-  title?: string;
-  createdAt?: Timestamp | Date | null;
-  commentsCount: number;
-  lovesCount: number;
-  likesCount: number;
-  sharesCount: number;
-  sound?: PostSound;
-  userId: string;
-}
 
 // The feed is muted while it moves, and unmuted this long after the last scroll event.
 const SCROLL_SETTLE_MS = 140;
@@ -87,100 +61,6 @@ function formatTime(seconds: number) {
 
 // FlatList keeps a reference to this object, so it has to live outside of the component.
 const viewabilityConfig = { itemVisiblePercentThreshold: 60 };
-
-function toCount(data: Record<string, unknown>, key: string) {
-  const value = data[key];
-  const parsed = typeof value === 'number' ? value : Number(value);
-
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
-}
-
-/**
- * The photo a post row draws, from whichever field carries it.
- *
- * `mediaUrl` is the cover and the array is the full set. The array is consulted as well because
- * documents written before the create path saved `mediaUrl` have only that, and reading the cover
- * alone left those posts with no photo at all.
- */
-function coverFrom(data: Record<string, unknown>): string | undefined {
-  if (typeof data.mediaUrl === 'string' && data.mediaUrl) {
-    return data.mediaUrl;
-  }
-
-  if (Array.isArray(data.mediaUrls)) {
-    const first = data.mediaUrls.find(
-      (item): item is string => typeof item === 'string' && /^https?:\/\//i.test(item),
-    );
-
-    if (first) {
-      return first;
-    }
-  }
-
-  return undefined;
-}
-
-function toPost(id: string, data: Record<string, unknown>): Post {
-  const createdAt = data.createdAt;
-  const mediaType = data.mediaType;
-
-  const post: Post = {
-    id,
-    // Only a hex colour is trusted: this string goes straight onto a view's background, so a
-    // hand-edited document cannot smuggle anything else into the feed's styling.
-    backgroundColor:
-      typeof data.backgroundColor === 'string' && /^#[0-9A-Fa-f]{6}$/.test(data.backgroundColor)
-        ? data.backgroundColor
-        : undefined,
-    caption: typeof data.caption === 'string' ? data.caption : undefined,
-    commentsCount: toCount(data, 'commentsCount'),
-    createdAt: createdAt instanceof Date || createdAt instanceof Timestamp ? createdAt : null,
-    // Posts written before the details screen have neither field, so both read as absent rather
-    // than as an empty line above the caption.
-    description: typeof data.description === 'string' ? data.description : undefined,
-    displayName: typeof data.displayName === 'string' ? data.displayName : undefined,
-    lovesCount: toCount(data, 'lovesCount'),
-    likesCount: toCount(data, 'likesCount'),
-    mediaType: mediaType === 'image' || mediaType === 'video' ? mediaType : undefined,
-    // The cover, falling back to the first entry of the array when the field is absent.
-    //
-    // Posts created before the writer started saving `mediaUrl` carry only `mediaUrls`, and this
-    // fallback is what makes their photo appear instead of the placeholder. It is a read-side
-    // repair, so it heals every existing document at once instead of waiting on a backfill; new
-    // posts save both fields, so the fallback never fires for them.
-    mediaUrl: coverFrom(data),
-    // The full set behind the cover, with anything that is not a usable http url dropped. A post
-    // with no array falls back to its single cover, so nothing written before the editor existed
-    // comes back as an empty list.
-    mediaUrls:
-      Array.isArray(data.mediaUrls) && data.mediaUrls.some((item) => typeof item === 'string')
-        ? (data.mediaUrls as unknown[]).filter(
-            (item): item is string => typeof item === 'string' && /^https?:\/\//i.test(item),
-          )
-        : typeof data.mediaUrl === 'string' && data.mediaUrl
-          ? [data.mediaUrl]
-          : [],
-    sharesCount: toCount(data, 'sharesCount'),
-    // Absent on posts written before visibility existed, which the rules treat as public, so the
-    // indicator is left off rather than showing a lock nobody set.
-    visibility: typeof data.visibility === 'string' ? data.visibility : undefined,
-    // A post without a usable sound object is treated as having no sound, so one bad document
-    // cannot break the row.
-    sound: toPostSoundValue(data.sound) ?? undefined,
-    title: typeof data.title === 'string' ? data.title : undefined,
-    userId: typeof data.userId === 'string' ? data.userId : '',
-  };
-  // The other half of the diagnostic the upload side prints. If these two lines disagree for the
-  // same post, the document was written with one url and is being served another; if they agree
-  // and the photo is still wrong, the object behind that url holds the wrong bytes and the fault
-  // is in what was uploaded. Read from the snapshot rather than from the rendered row, so it fires
-  // once per document Firestore delivers.
-  if (__DEV__) {
-    console.log('Feed post media', { mediaUrl: post.mediaUrl ?? '', postId: id });
-  }
-
-  return post;
-}
 
 function PostVideo({
   uri,
@@ -693,14 +573,13 @@ export default function Home() {
   // it. Each query below is shaped so one clause of the rule proves it on its own, and the results
   // are merged here.
   //
-  //   public         -> proves the "visibility == public" clause
-  //   legacy         -> posts written before the field existed, which the rules also treat as public
-  //   own posts      -> proves the "userId == me" clause
-  //   visibleToUids  -> proves the "me in the audience" clause, via array-contains
-  //
-  // All four are needed: the public query misses your own private posts, the own-posts query
-  // misses everyone else's, and the audience query is what a restricted post from someone you
-  // follow comes back on.
+    //   public         -> proves the "visibility == public" clause
+    //   own posts      -> proves the "userId == me" clause
+    //   visibleToUids  -> proves the "me in the audience" clause, via array-contains
+    //
+    // All three are needed: the public query misses your own private posts, the own-posts query
+    // misses everyone else's, and the audience query is what a restricted post from someone you
+    // follow comes back on.
   useEffect(() => {
     if (!viewerId) {
       return undefined;
@@ -709,10 +588,12 @@ export default function Home() {
     const db = getFirebaseDb();
     // Merged by id, so a post that matches two of the queries is held once. The map is the
     // accumulator every listener writes into, which is why it is built once per effect run rather
-    // than per snapshot.
-    // Whether a post arrived on the audience query, which is the only query that can prove its
-    // author follows the viewer. The Friends tab needs that in order to work out a mutual follow.
-    const merged = new Map<string, { fromAudience: boolean; post: Post }>();
+    // than per snapshot. `from` is the set of listener indexes currently backing the post, which is
+    // what makes a removal from one query distinguishable from a removal from all of them.
+    const merged = new Map<string, { from: Set<number>; post: Post }>();
+    // One entry per query, holding the ids that query returned last time. A snapshot replaces its
+    // own entry, so a post leaving one query can be released even though the map is shared.
+    const listeners: { fromAudience: boolean; ids: Set<string> }[] = [];
     // Bumped on every publish and on teardown, so a slow readFollow belonging to a tab that is no
     // longer selected cannot land on top of the tab that replaced it.
     let publishGeneration = 0;
@@ -747,10 +628,15 @@ export default function Home() {
       // simply empty for someone whose network has posted nothing restricted.
       if (selectedTab === 'Friends') {
         const followed = new Map<string, boolean>();
+        // Whether a post arrived on the audience query, which is the only query that can prove its
+        // author follows the viewer. Derived from the queries still backing it rather than latched
+        // on arrival, so a post that has since left the audience query stops counting as one.
+        const reachedByAudience = (entry: { from: Set<number> }) =>
+          entry.from.size > 0 && [...entry.from].some((index) => listeners[index]?.fromAudience);
 
         await Promise.all(
           entries
-            .filter((entry) => entry.fromAudience && entry.post.userId)
+            .filter((entry) => reachedByAudience(entry) && entry.post.userId)
             .map((entry) => readFollow(viewerId, entry.post.userId).then((isFollowing) => {
               followed.set(entry.post.userId, isFollowing);
             })),
@@ -762,7 +648,7 @@ export default function Home() {
 
         entries = entries.filter((entry) => (
           entry.post.userId === viewerId
-          || (entry.fromAudience && followed.get(entry.post.userId) === true)
+          || (reachedByAudience(entry) && followed.get(entry.post.userId) === true)
         ));
       }
 
@@ -793,27 +679,71 @@ export default function Home() {
       setLoading(false);
     };
 
-    // A post is stored by whichever query found it, and `fromAudience` is OR'd in rather than
-    // overwritten. Without that, a post matching both the public and the audience query would be
-    // relabelled as public-only by whichever listener fired last and drop out of the Friends tab.
-    const listen = (label: string, fromAudience: boolean, q: Query<DocumentData>) => onSnapshot(
-      q,
-      (snapshot) => {
-        snapshot.forEach((postDocument) => {
-          const post = toPost(postDocument.id, postDocument.data());
-          const existing = merged.get(post.id);
+    // A post is stored by whichever query found it, and the queries it came from are tracked so a
+    // later snapshot can take one of them back off again.
+    //
+    // Each `onSnapshot` callback delivers the query's complete current result set, not a delta, so
+    // the set has to be *replaced* on every callback rather than accumulated into. Only ever adding
+    // meant a deleted post was simply absent from the next snapshot while staying in the map
+    // forever, so it kept being published and the row never left the feed.
+    const listen = (label: string, fromAudience: boolean, q: Query<DocumentData>) => {
+      // Which of the queries this listener stands for, used to work out whether a post is still
+      // backed by anything once one of them stops returning it.
+      const index = listeners.length;
+      listeners.push({ fromAudience, ids: new Set<string>() });
 
-          merged.set(post.id, {
-            fromAudience: fromAudience || Boolean(existing?.fromAudience),
-            post,
+      return onSnapshot(
+        q,
+        (snapshot) => {
+          const next = new Set<string>();
+
+          snapshot.forEach((postDocument) => {
+            const post = toPost(postDocument.id, postDocument.data());
+
+            next.add(post.id);
+
+            // The post data itself is refreshed from whichever query reports it, but the set of
+            // contributing queries is kept: a post on both the public and the audience queries has to
+            // remember both, or losing one would relabel it and drop it out of the Friends tab.
+            const existing = merged.get(post.id);
+
+            merged.set(post.id, { from: existing?.from ?? new Set<number>(), post });
           });
-        });
-        // Published on every query rather than only when all of them land, so a slow or denied query
-        // cannot leave the feed stuck on its spinner with nothing in it.
-        void publish();
-      },
-      onError(label),
-    );
+
+          next.forEach((id) => {
+            merged.get(id)?.from.add(index);
+          });
+
+          // Anything this query used to return and no longer does is released. The post only leaves
+          // the map when no remaining query still backs it, which is what keeps a post that matched
+          // two queries alive while either one still has it.
+          listeners[index].ids.forEach((id) => {
+            if (next.has(id)) {
+              return;
+            }
+
+            const entry = merged.get(id);
+
+            if (!entry) {
+              return;
+            }
+
+            entry.from.delete(index);
+
+            if (entry.from.size === 0) {
+              merged.delete(id);
+            }
+          });
+
+          listeners[index].ids = next;
+
+          // Published on every query rather than only when all of them land, so a slow or denied query
+          // cannot leave the feed stuck on its spinner with nothing in it.
+          void publish();
+        },
+        onError(label),
+      );
+    };
 
     const publicPosts = () => [
       listen('public', false, query(
@@ -822,16 +752,14 @@ export default function Home() {
         orderBy('createdAt', 'desc'),
         limit(FEED_QUERY_LIMIT),
       )),
-      // Posts written before visibility existed. Firestore's `==` does not match a missing field,
-      // but `== null` does, so without this every existing post would silently drop out of the feed
-      // the moment the rules were deployed. Delete this query after the posts collection has been
-      // backfilled with `visibility: 'public'`.
-      listen('legacy', false, query(
-        collection(db, 'posts'),
-        where('visibility', '==', null),
-        orderBy('createdAt', 'desc'),
-        limit(FEED_QUERY_LIMIT),
-      )),
+      // There is deliberately no query for posts written before visibility existed. It used to be
+      // here as `where('visibility', '==', null)`, which does match those documents but is refused
+      // by the rules: Firestore will not take a null equality as proof of the read rule, because
+      // `== null` also matches a field that is not present and the rules language cannot express
+      // "this field is absent". It logged "Missing or insufficient permissions" on every launch and
+      // returned nothing. Those posts are given a visibility by their author on sign-in instead, in
+      // src/hooks/use-visibility-backfill.ts, and then they arrive on the public query like any
+      // other post.
     ];
 
     // The viewer's own posts, on every tab but Public. Only this query can return an only_me post,
@@ -948,10 +876,23 @@ export default function Home() {
     setDeletingPostId(post.id);
     closeOptions();
 
+    // The row is taken out of local state straight away rather than waiting for the listener to
+    // report the document gone. Firestore's snapshot round trip is short but not instant, and for a
+    // destructive action the user is entitled to see the result of their tap immediately; the
+    // listener then confirms it a moment later. The previous list is kept so a delete that fails can
+    // put the post back, since the document still exists and nothing else would redraw it.
+    const previousFeed = feed;
+
+    setFeed((current) => ({
+      ...current,
+      posts: current.posts.filter((entry) => entry.id !== post.id),
+    }));
+
     try {
       await deletePost(post);
     } catch (error) {
       console.error('Could not delete the post:', error);
+      setFeed(previousFeed);
       notify(
         'Could not delete',
         isFirestorePermissionError(error)
@@ -962,7 +903,7 @@ export default function Home() {
       // Cleared whatever happened, so a failed delete cannot leave the row stuck as busy.
       setDeletingPostId('');
     }
-  }, [closeOptions]);
+  }, [closeOptions, feed]);
 
   // The text, the audience and the photos are passed as params rather than the whole post: the
   // route param is the only thing that survives being read back on a cold start. The editor still
@@ -1388,66 +1329,6 @@ interface ReactionFlags {
   loved?: boolean;
 }
 
-// Follow state is a plain per-author document, so it is fetched once and shared instead of
-// being re-read every time a row remounts.
-const followCache = new Map<string, boolean>();
-const pendingFollows = new Map<string, Promise<boolean>>();
-
-// Set once the rules reject the follow documents; retrying can only fail again.
-let followIsDenied = false;
-
-function readFollow(viewerId: string, authorId: string): Promise<boolean> {
-  if (followIsDenied) {
-    return Promise.resolve(false);
-  }
-
-  const cacheId = `${viewerId}|${authorId}`;
-  const cached = followCache.get(cacheId);
-
-  if (cached !== undefined) {
-    return Promise.resolve(cached);
-  }
-
-  const inFlight = pendingFollows.get(cacheId);
-
-  if (inFlight) {
-    return inFlight;
-  }
-
-  const read = (async () => {
-    try {
-      const snapshot = await getDoc(doc(
-        getFirebaseDb(),
-        'users',
-        viewerId,
-        'following',
-        authorId,
-      ));
-      const exists = snapshot.exists();
-
-      followCache.set(cacheId, exists);
-      return exists;
-    } catch (error) {
-      if (isFirestorePermissionError(error)) {
-        followIsDenied = true;
-        console.warn(
-          'Follow state is not readable with the deployed Firestore rules. '
-          + 'Allow users/{uid}/following, then redeploy firestore.rules.',
-        );
-        return false;
-      }
-
-      console.error('Could not load follow state:', error);
-      return false;
-    } finally {
-      pendingFollows.delete(cacheId);
-    }
-  })();
-
-  pendingFollows.set(cacheId, read);
-  return read;
-}
-
 type ReactionCounts = Record<'like' | 'love', number>;
 
 // Every row that mounts opens its own listener on the reactions collection, and FlatList
@@ -1571,6 +1452,21 @@ async function recordShare(postId: string) {
 
 // react-native-web rejects the call outright in a browser without the Web Share API, so the
 // capability is checked before sharing rather than caught after the fact.
+/**
+ * Somebody's profile, opened from the author row on a post.
+ *
+ * The display name is passed along because the profile can draw its heading before its own read
+ * finishes, and the read still wins afterwards -- so a name that has since changed shows up correctly
+ * on the other side of the tap.
+ */
+function openAuthorProfile(authorId: string, displayName: string) {
+  if (!authorId) {
+    return;
+  }
+
+  router.push({ params: { name: displayName, uid: authorId }, pathname: '/user/[uid]' } as never);
+}
+
 function canOpenShareSheet() {
   if (Platform.OS !== 'web') {
     return true;
@@ -1744,18 +1640,12 @@ function SocialActions({
     setIsMutating(true);
 
     try {
-      const followRef = doc(getFirebaseDb(), 'users', currentUserId, 'following', authorId);
-
-      if (nextIsFollowing) {
-        await setDoc(followRef, { createdAt: serverTimestamp(), userId: authorId });
-      } else {
-        await deleteDoc(followRef);
-      }
-
-      followCache.set(`${currentUserId}|${authorId}`, nextIsFollowing);
+      // The shared writer, so the feed's button and the profile's button are the same state: one
+      // cache, one write, one follower count to keep in step.
+      await setFollowing(currentUserId, authorId, nextIsFollowing);
       setIsFollowing(nextIsFollowing);
     } catch (error) {
-      followCache.delete(`${currentUserId}|${authorId}`);
+      console.error('Could not update follow:', error);
 
       if (isFirestorePermissionError(error)) {
         Alert.alert(
@@ -1765,7 +1655,6 @@ function SocialActions({
         return;
       }
 
-      console.error('Could not update follow:', error);
       Alert.alert('Could not save', 'Please check your connection and try again.');
     } finally {
       setIsMutating(false);
@@ -1853,12 +1742,24 @@ function SocialActions({
   return (
     <View style={[styles.socialBar, { bottom: bottomInset }]}>
       <View style={styles.socialAuthor}>
-        <View style={styles.socialAvatar}>
-          <Text style={styles.socialAvatarLetter}>
-            {(post.displayName || 'User').charAt(0).toUpperCase()}
-          </Text>
-        </View>
-        <Text numberOfLines={1} style={styles.socialUsername}>@{post.displayName || 'User'}</Text>
+        {/* The avatar and the name are one press target: this is the post's own row, and the profile
+            behind it is the only place that can answer "who is this and what else have they posted".
+            The follow button beside them stays separate, because pressing a name and pressing Follow are
+            two different decisions. */}
+        <Pressable
+          accessibilityLabel={`Open ${post.displayName || 'this account'}'s profile`}
+          accessibilityRole="button"
+          disabled={!authorId}
+          onPress={() => openAuthorProfile(authorId, post.displayName ?? '')}
+          style={styles.socialAuthorPress}
+        >
+          <View style={styles.socialAvatar}>
+            <Text style={styles.socialAvatarLetter}>
+              {(post.displayName || 'User').charAt(0).toUpperCase()}
+            </Text>
+          </View>
+          <Text numberOfLines={1} style={styles.socialUsername}>@{post.displayName || 'User'}</Text>
+        </Pressable>
         {isOwnPost ? null : (
           <Pressable
             accessibilityRole="button"
@@ -2156,6 +2057,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
     flex: 1,
+    minWidth: 0,
+  },
+  // The pressable version of the same row: the avatar and the name, with the follow button left out
+  // of it, so pressing one of them is not the same decision as pressing the other.
+  socialAuthorPress: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    flex: 1,
+    gap: 8,
     minWidth: 0,
   },
   socialAvatar: {

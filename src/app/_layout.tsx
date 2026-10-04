@@ -6,10 +6,54 @@ import { doc, getDoc } from 'firebase/firestore';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
 
 import { CaptureProvider } from '@/components/capture-provider';
 import { ErrorBoundary } from '@/components/error-boundary';
+import { useBotResponder } from '@/hooks/use-bot-responder';
+import { usePresenceReporter } from '@/hooks/use-presence';
+import { useVisibilityBackfill } from '@/hooks/use-visibility-backfill';
 import { getFirebaseAuth, getFirebaseDb } from '@/lib/firebase';
+import { FeatureFlagsProvider } from '@/lib/feature-flags';
+
+/**
+ * Keeps this account's presence published for as long as it is signed in.
+ *
+ * A component rather than a hook called in RootLayout, because the root returns early while the
+ * navigator and the signed-in gate are still resolving, and a hook called across those early returns
+ * would be called in a different order each time and lose its subscriptions.
+ */
+function PresenceReporter() {
+  usePresenceReporter();
+
+  return null;
+}
+
+/**
+ * Answers messages, but only when this account is the bot.
+ *
+ * A separate component from PresenceReporter for the same reason it is one at all: a hook called in
+ * RootLayout would be called across the early returns below and lose its subscriptions. Both are
+ * silent, and both are off for anybody whose profile is not flagged, so a normal build does nothing
+ * here.
+ */
+function BotResponder() {
+  useBotResponder();
+
+  return null;
+}
+
+/**
+ * Gives this account's older posts a visibility, once, on sign-in.
+ *
+ * A component for the same reason as the two above: RootLayout returns early while auth and the
+ * navigator resolve, and a hook called across those returns loses its subscriptions.
+ */
+function VisibilityBackfill() {
+  useVisibilityBackfill();
+
+  return null;
+}
 
 export default function RootLayout() {
   return (
@@ -18,11 +62,23 @@ export default function RootLayout() {
     // root. Cheap to keep, and removing it risks breaking navigation gestures.
     <GestureHandlerRootView style={styles.root}>
       <ErrorBoundary>
-        {/* Above the navigator so a capture survives navigating from the camera to the story
-            editor and on to the details screen. */}
-        <CaptureProvider>
-          <RootNavigator />
-        </CaptureProvider>
+        {/* Above the navigator, and above everything that reads a flag. Without this mounted the whole
+            override layer was dead: `useFeatureFlag` fell back to the build-time values, so AsyncStorage
+            was never read, `setOverride` was unreachable, and a flag could only be changed by editing
+            app.json and shipping a build. It wraps the navigator rather than living inside a screen so a
+            flag read during the first render already has the device's overrides applied. */}
+        <FeatureFlagsProvider>
+          {/* Above the navigator so a capture survives navigating from the camera to the story
+              editor and on to the details screen. */}
+          <CaptureProvider>
+            {/* Inside the providers but above the navigator, so presence is published from launch and
+                survives navigating anywhere in the app. */}
+            <PresenceReporter />
+            <BotResponder />
+            <VisibilityBackfill />
+            <RootNavigator />
+          </CaptureProvider>
+        </FeatureFlagsProvider>
       </ErrorBoundary>
     </GestureHandlerRootView>
   );
@@ -149,7 +205,18 @@ function RootNavigator() {
     );
   }
 
-  return <Stack screenOptions={{ headerShown: false }} />;
+  return (
+    // Above the navigator so every screen gets the same keyboard handling, and so the measure is
+    // taken once for the whole app rather than per screen.
+    //
+    // Android 16 enforces edge-to-edge, so the window no longer resizes for the keyboard and
+    // React Native's own KeyboardAvoidingView, which relies on that resize when `behavior` is
+    // undefined, leaves the composer under the keyboard. This provider is what makes the keyboard
+    // height readable on Android, which the screens use to move their inputs clear of it.
+    <KeyboardProvider>
+      <Stack screenOptions={{ headerShown: false }} />
+    </KeyboardProvider>
+  );
 }
 
 const styles = StyleSheet.create({

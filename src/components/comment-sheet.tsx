@@ -1,4 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
+import { router } from 'expo-router';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -76,6 +77,19 @@ function readViewerName(uid: string) {
   })();
 
   return pendingViewerName;
+}
+
+// A comment's writer, opened from the name on their comment.
+//
+// The name travels along because the profile can draw a heading before its own read finishes, and the
+// read still wins afterwards: a name written on a comment is a snapshot of somebody, while the profile
+// is the account itself.
+function openProfile(userId: string, displayName: string) {
+  if (!userId) {
+    return;
+  }
+
+  router.push({ params: { name: displayName, uid: userId }, pathname: '/user/[uid]' } as never);
 }
 
 // Nothing is mounted while the sheet is closed, so the listener, the draft and the list all
@@ -312,7 +326,19 @@ const remove = useCallback(async (comment: PostComment) => {
       </View>
 
       <View style={styles.rowBody}>
-        <Text numberOfLines={1} style={styles.rowName}>{item.displayName}</Text>
+        {/* The name is the way to the person, not just a label: a comment is the one place in this
+            app where somebody you have never seen writes at you, and a name you cannot press is a name
+            you cannot look up. The account id travels with it so the profile can start as soon as it
+            opens; the profile reads the person itself and overwrites whatever name was passed here. */}
+        <Pressable
+          accessibilityLabel={`Open ${item.displayName}'s profile`}
+          accessibilityRole="button"
+          disabled={!item.userId}
+          onPress={() => openProfile(item.userId, item.displayName)}
+          style={({ pressed }) => pressed && styles.pressed}
+        >
+          <Text numberOfLines={1} style={styles.rowName}>{item.displayName}</Text>
+        </Pressable>
 
         {item.replyToName ? (
           <Text numberOfLines={2} style={styles.rowText}>
@@ -596,6 +622,7 @@ const styles = StyleSheet.create({
   avatarLetter: { color: '#FFFFFF', fontSize: 13, fontWeight: '800' },
   rowBody: { flex: 1, minWidth: 0 },
   rowName: { color: '#FFFFFF', fontSize: 13, fontWeight: '700' },
+  pressed: { opacity: 0.7 },
   rowText: { color: '#60A5FA', fontSize: 14, lineHeight: 19 },
   rowTextPlain: { color: '#E5E7EB', fontSize: 14, lineHeight: 19 },
   rowMeta: { alignItems: 'center', flexDirection: 'row', gap: 12, marginTop: 4 },

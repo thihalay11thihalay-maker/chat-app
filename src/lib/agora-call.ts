@@ -1,3 +1,5 @@
+import { getFirebaseAuth } from '@/lib/firebase';
+
 export type CallType = 'audio' | 'video';
 
 export const CALL_TYPES: CallType[] = ['audio', 'video'];
@@ -26,15 +28,80 @@ export function callChannelName(chatId: string) {
 export const AGORA_APP_ID = process.env.EXPO_PUBLIC_AGORA_APP_ID ?? '';
 
 /**
- * TEMPORARY. A real Agora App Certificate must never ship in a client, so this placeholder is
- * deliberately not a valid token: the call screen checks for it and refuses to join with an
- * actionable message instead of failing silently inside the native SDK.
+ * Where to ask for a call token.
  *
- * Replace the body with a short-lived token from your token server once that exists.
+ * A token is signed with the project's App Certificate, and a certificate in the app bundle is a
+ * certificate every reader of the bundle can sign with. So the certificate lives in a Node process
+ * (scripts/agora-token.js) and the app asks it for a token per call, which is also how this has to work
+ * once there is a real server rather than a laptop.
+ *
+ * Has to be the machine's LAN address on a phone: `localhost` on the device is the device.
  */
-export const TEMP_AGORA_TOKEN = 'REPLACE_WITH_TEMP_AGORA_TOKEN';
+export const AGORA_TOKEN_SERVER = process.env.EXPO_PUBLIC_AGORA_TOKEN_SERVER ?? '';
 
-export const PLACEHOLDER_TOKEN = 'REPLACE_WITH_TEMP_AGORA_TOKEN';
+/**
+ * How long a token request may take before it is given up on.
+ *
+ * Short, because it is a signature on a piece of text rather than a video stream: the token comes from a
+ * process on the same network, and anything slower than this means the address in
+ * EXPO_PUBLIC_AGORA_TOKEN_SERVER is wrong rather than slow. Waiting thirty seconds would only delay the
+ * message that says so.
+ */
+const TOKEN_TIMEOUT_MS = 8_000;
 
-/** The two ways a call can fail before the SDK is even reached. */
-export type CallSetupError = 'no-app-id' | 'placeholder-token' | 'permission-denied';
+/** The two ways a call can fail before the SDK is even reached, plus a third for the token service. */
+export type CallSetupError = 'no-app-id' | 'no-token-service' | 'permission-denied' | 'token-refused';
+
+/**
+ * A token for one channel, from the token service.
+ *
+ * `uid` is not sent: the service takes it from the Firebase ID token in the `Authorization` header and
+ * ignores anything in the query string. That is the point -- a caller who can choose its own uid can mint a
+ * token as somebody else, so the uid is something the service reads off a credential it verified.
+ *
+ * The ID token is this account's own, refreshed on demand, which is also why the service can tell a
+ * signed-in caller from an anonymous one.
+ */
+export async function requestCallToken(channel: string) {
+  if (!AGORA_TOKEN_SERVER) {
+    throw new Error('no-token-service');
+  }
+
+  // A search the reader walked away from is still in flight otherwise, and its answer lands on a call
+  // screen that has gone.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TOKEN_TIMEOUT_MS);
+
+  try {
+    const url = `${AGORA_TOKEN_SERVER.replace(/\/+$/, '')}/token?channel=${encodeURIComponent(channel)}`;
+    const idToken = await getFirebaseAuth().currentUser?.getIdToken();
+    const response = await fetch(url, {
+      headers: idToken ? { Authorization: `Bearer ${idToken}` } : undefined,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      // The service answered and said no, which is a different thing from not answering: this is a
+      // configuration problem on the server rather than a phone that cannot see it.
+      throw new Error('token-refused');
+    }
+
+    const body = await response.json() as { token?: unknown };
+
+    if (typeof body.token !== 'string' || body.token === '') {
+      throw new Error('token-refused');
+    }
+
+    return body.token;
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('no-token-service');
+    }
+
+    // Anything else -- a wrong address, the service not running, a phone with no route to the laptop --
+    // is the same problem from the reader's side: there was no answer, so say which one it was.
+    throw error instanceof Error && error.message === 'token-refused' ? error : new Error('no-token-service');
+  } finally {
+    clearTimeout(timer);
+  }
+}

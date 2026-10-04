@@ -1,0 +1,54 @@
+{
+  "//": "What the bot says back, in one file so there is a single answer to 'what does the bot reply with'. src/lib/bot.ts compiles the patterns and picks a line for the bot running on a device, and scripts/bot-online.js reads the same table for the bot running as a headless process. Kept as data rather than as code because two copies of a canned conversation is two copies to keep in step, and a tester who is answered differently depending on how the bot happens to be running cannot tell which one they are looking at.",
+  "rules": [
+    {
+      "//": "Burmese greetings first. The word-order patterns below are Latin and cannot match Burmese text, so without this a greeting typed in the app's own language would fall through to the canned fallback.",
+      "test": "မင်္ဂလာ|မင်္ဂလာပါ|ဟေမုန်|ကျွန်တော်",
+      "replies": [
+        "မင်္ဂလာပါ။ ကျွန်တော် ဒီအက်ပ်ထဲက bot ပါ။ မေးချင်တာ ရှိရင် မေးနိုင်ပါတယ်။",
+        "မင်္ဂလာပါ။ စာပို့တဲ့လမ်းကြောင်းကို ဒီက အလုပ်လုပ်နေတာမို့ သေချာစေပါတယ်။ စာထပ်ပို့ပါစေ။"
+      ]
+    },
+    {
+      "test": "\\b(hi|hey|hello|yo|hola|mingalaba)\\b",
+      "replies": [
+        "Hi! I am here and answering on my own device, so this proves the whole path end to end.",
+        "Hey. Typing, sending, delivery and unread badges are all live on this side.",
+        "Hello. If this arrived while you were on another screen, the listener is working."
+      ]
+    },
+    {
+      "test": "\\?|^(what|why|how|when|where|who|which)\\b",
+      "replies": [
+        "Good question. I am only a test double, so I do not have an opinion worth much, but the answer you get is the same shape a real reply would be: written to the subcollection, timestamped by the server, and copied into the room preview the inbox reads.",
+        "I cannot really know, but I can tell you the message went through: it arrived here, which means the sender is authenticated, is a participant of this room, and the rules let it past all three."
+      ]
+    },
+    {
+      "test": "\\b(thanks|thank you|cheers|ok|okay|cool|nice|great)\\b",
+      "replies": [
+        "Thanks for the message. Long replies matter too, because a conversation list truncates them to one line and a bubble wraps them, and both only show what they do if something long was actually sent."
+      ]
+    },
+    {
+      "test": "\\b(call|voice|video|meet)\\b",
+      "replies": [
+        "I cannot join a call, so the voice and video buttons in the header are not something this bot can test. The message path either side of them is what this covers."
+      ]
+    },
+    {
+      "test": "\\b(long|more|again|another|second)\\b",
+      "replies": [
+        "Sending you something back so there is more than one line in this conversation. Scroll up and down: the list should stay pinned to the bottom as these arrive.",
+        "Two messages in a row from one sender is worth testing, because the room preview and the unread counter are only right if each of them lands in order.",
+        "This reply is here to make the bubble wrap over more than one line, and to check that the timestamp still sits at the bottom right of it."
+      ]
+    }
+  ],
+  "fallback": [
+    "Got it. I am the test bot, so this is a canned answer rather than a thought.",
+    "Received. That is one more message through the real send path.",
+    "Noted. Try asking a question, or sending \"thanks\", to steer what comes back.",
+    "Understood. Everything you see here came through the same rules a real account goes through."
+  ]
+}

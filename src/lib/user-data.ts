@@ -1,5 +1,20 @@
 export type UserData = Record<string, unknown>;
 
+/**
+ * The order a person's name is looked for in, and the order their picture is.
+ *
+ * Exported rather than repeated at each call site, because every screen that draws a person has to answer
+ * the same two questions and there were five separate answers. They had drifted: some accepted an empty
+ * string as a name, some trimmed whitespace, and only some fell through to the next field. So the same
+ * profile could show a picture in the inbox and a letter initial on the profile screen.
+ *
+ * These are the fields this app has actually written over time. `displayName` first because that is what
+ * onboarding sets; the rest are older shapes kept for profiles written before it. Adding a field here
+ * fixes every screen at once, which is the entire reason they live here.
+ */
+export const PERSON_NAME_KEYS = ['displayName', 'name', 'username'];
+export const PERSON_PHOTO_KEYS = ['profilePictureUrl', 'photoURL', 'photoUrl', 'avatarUrl'];
+
 export function getString(data: UserData, keys: string[], fallback = '') {
     for (const key of keys) {
         const value = data[key];

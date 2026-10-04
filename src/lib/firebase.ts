@@ -13,7 +13,8 @@ import {
     signInWithEmailAndPassword,
     signInWithPopup,
 } from 'firebase/auth';
-import { Firestore, getFirestore } from 'firebase/firestore';
+import { Database, getDatabase } from 'firebase/database';
+import { Firestore, getFirestore, initializeFirestore } from 'firebase/firestore';
 import { FirebaseStorage, getStorage } from 'firebase/storage';
 import { Platform } from 'react-native';
 
@@ -24,10 +25,18 @@ const firebaseConfig = {
   storageBucket: process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET ?? '',
   messagingSenderId: process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID ?? '',
   appId: process.env.EXPO_PUBLIC_FIREBASE_APP_ID ?? '',
+    // Realtime Database is a separate product from Firestore and is not switched on by being
+    // configured here, only by having an instance created for the project. Project chat-app-2d28f has
+    // one: chat-app-2d28f-default-rtdb, in asia-southeast1. The url is read from the environment
+    // rather than built from the project id, because the instance name is chosen when the database is
+    // created and the region is part of the hostname, so neither can be guessed from the project id.
+    // Without it, presence and typing are switched off and everything else still works.
+    databaseURL: process.env.EXPO_PUBLIC_FIREBASE_DATABASE_URL ?? '',
 };
 
 let auth: Auth | null = null;
 let firestore: Firestore | null = null;
+let realtimeDb: Database | null = null;
 let storage: FirebaseStorage | null = null;
 let recaptchaVerifier: RecaptchaVerifier | null = null;
 
@@ -42,7 +51,18 @@ export function isFirebaseConfigured() {
 }
 
 export function isFirebaseStorageConfigured() {
-  return Boolean(firebaseConfig.storageBucket);
+    return Boolean(firebaseConfig.storageBucket);
+}
+
+/**
+ * Whether a Realtime Database url has been provided at all.
+ *
+ * Separate from getFirebaseRealtimeDb because a screen needs to tell "this person is offline" apart
+ * from "presence is switched off for this build". The second must not be reported as the first: an
+ * honest blank is better than a confident wrong answer next to somebody's name.
+ */
+export function isRealtimeDatabaseConfigured() {
+    return Boolean(firebaseConfig.databaseURL);
 }
 
 function assertFirebaseConfigured(message: string) {
@@ -92,8 +112,48 @@ export function getFirebaseAuth() {
 export function getFirebaseDb() {
   if (firestore) return firestore;
 
-  firestore = getFirestore(getFirebaseApp());
+  const app = getFirebaseApp();
+
+  try {
+    // `ignoreUndefinedProperties` because this codebase writes optional fields by spreading a value that
+    // may be absent, and the SDK's default is to refuse the whole write rather than leave that one field
+    // out: one `expiresAt: undefined` on a room with the disappearing timer off was enough to stop every
+    // message from being sent, with an error that named nothing the reader could act on. Fields that are
+    // genuinely meant to be cleared use `deleteField`, which this does not affect.
+    firestore = initializeFirestore(app, { ignoreUndefinedProperties: true });
+  } catch (error) {
+    // Thrown when something already created the instance for this app, which is how the web build gets
+    // here: `getFirestore` hands back the instance it made rather than a second one.
+    console.warn('Firestore was already initialised; using the existing instance:', error);
+
+    firestore = getFirestore(app);
+  }
+
   return firestore;
+}
+
+/**
+ * Realtime Database handle, or null when there is nothing to connect to.
+ *
+ * Null rather than a throw, because presence is decoration on the chat list: a missing database
+ * must cost the green dots, not the conversation list. The url is read from the environment rather
+ * than guessed from the project id, because the instance name is chosen when the database is
+ * created and the two usual shapes are not both correct.
+ */
+export function getFirebaseRealtimeDb(): Database | null {
+  const url = firebaseConfig.databaseURL;
+
+  if (!url) {
+    return null;
+  }
+
+  try {
+    realtimeDb ??= getDatabase(getFirebaseApp(), url);
+    return realtimeDb;
+  } catch (error) {
+    console.warn('Realtime Database is unavailable:', error);
+    return null;
+  }
 }
 
 export function getFirebaseStorage() {

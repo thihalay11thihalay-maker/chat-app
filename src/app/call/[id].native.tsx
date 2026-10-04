@@ -14,10 +14,10 @@ import AgoraRTC, {
 
 import {
   AGORA_APP_ID,
+  AGORA_TOKEN_SERVER,
   callChannelName,
   isCallType,
-  PLACEHOLDER_TOKEN,
-  TEMP_AGORA_TOKEN,
+  requestCallToken,
   type CallSetupError,
 } from '@/lib/agora-call';
 import { findMockChat } from '@/lib/mock-chats';
@@ -53,13 +53,13 @@ export default function CallScreen() {
   const mockChat = findMockChat(chatId);
   const displayName = mockChat?.name ?? (chatId ? `Chat ${chatId}` : 'Unknown contact');
 
-  // Missing App ID and an unset token are properties of the build, not things that change while the
+  // Missing App ID and an unset token service are properties of the build, not things that change while the
   // screen is open, so they are derived during render instead of being pushed through state from
   // an effect. Only outcomes that genuinely arrive at runtime live in setupError.
   const configError: CallSetupError | null = !AGORA_APP_ID
     ? 'no-app-id'
-    : !TEMP_AGORA_TOKEN || TEMP_AGORA_TOKEN === PLACEHOLDER_TOKEN
-      ? 'placeholder-token'
+    : !AGORA_TOKEN_SERVER
+      ? 'no-token-service'
       : null;
 
   const [setupError, setSetupError] = useState<CallSetupError | null>(null);
@@ -149,6 +149,15 @@ export default function CallScreen() {
       }
 
       try {
+        // Asked for here rather than at module load: a token is short lived, the service is a separate
+        // process that may have been started after the app was, and a call that starts a minute after the
+        // screen opens should get a token minted for that minute.
+        const token = await requestCallToken(callChannelName(chatId));
+
+        if (cancelled) {
+          return;
+        }
+
         const agoraEngine = getEngine();
         const context = new RtcEngineContext();
         context.appId = AGORA_APP_ID;
@@ -190,14 +199,17 @@ export default function CallScreen() {
 
         // uid 0 asks the SDK to assign one. Each side therefore gets a distinct id, which is what
         // the remote canvas below needs to find its stream.
-        agoraEngine.joinChannel(TEMP_AGORA_TOKEN, callChannelName(chatId), 0, {
+        agoraEngine.joinChannel(token, callChannelName(chatId), 0, {
           autoSubscribeAudio: true,
           autoSubscribeVideo: isVideoCall,
           clientRoleType: ClientRoleType.ClientRoleBroadcaster,
         });
       } catch (error) {
+        // A token that could not be fetched is the common case and is already a sentence; anything else
+        // is the SDK refusing something, and it is reported as a configuration problem rather than
+        // failing silently inside the engine.
         console.error('Agora join failed:', error);
-        setSetupError('no-app-id');
+        setSetupError(error instanceof Error && error.message === 'token-refused' ? 'token-refused' : 'no-app-id');
       }
     }
 
@@ -395,16 +407,19 @@ export default function CallScreen() {
 
 const SETUP_ERROR_TITLE: Record<CallSetupError, string> = {
   'no-app-id': 'Calling is not configured',
+  'no-token-service': 'The call token service is not reachable',
   'permission-denied': 'Permission needed',
-  'placeholder-token': 'Test token needed',
+  'token-refused': 'The token service said no',
 };
 
 const SETUP_ERROR_BODY: Record<CallSetupError, string> = {
   'no-app-id': 'EXPO_PUBLIC_AGORA_APP_ID was not found. Add it to .env.local and restart the dev server.',
+  'no-token-service':
+    'A call token comes from a small service on your computer, because the Agora App Certificate must never ship inside the app. Start it with `npm run call:tokens`, then put the address it prints into EXPO_PUBLIC_AGORA_TOKEN_SERVER in .env.local and restart the dev server. On a phone that address has to be your computer\'s LAN address, not localhost.',
   'permission-denied':
     'Camera or microphone access was declined. Grant it in system settings and try the call again.',
-  'placeholder-token':
-    'The temporary Agora token is still the placeholder. Set TEMP_AGORA_TOKEN in src/lib/agora-call.ts to a short-lived token.',
+  'token-refused':
+    'The token service is running but would not issue a token for this call. Check that AGORA_APP_CERTIFICATE in .env.local is the App Certificate rather than the App ID.',
 };
 
 type ControlButtonProps = {

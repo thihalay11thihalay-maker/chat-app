@@ -27,6 +27,44 @@
         { "fieldPath": "visibleToUids", "arrayConfig": "CONTAINS" },
         { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "//": "A profile's public posts, newest first. The feed's public query plus an equality on the author: two equality filters with an order on a third field cannot be served by any single-field index, so this triple is its own index.",
+      "collectionGroup": "posts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "//": "A profile's restricted posts that the viewer is in the audience of. Same shape as the restricted feed with the author narrowed onto it.",
+      "collectionGroup": "posts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "visibleToUids", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "//": "The inbox. `array-contains` on participants combined with an order on a different field cannot be served by a single-field index, so this pair needs its own. The listener also has to pair it with the participants filter in the rules: without the filter the rules cannot be validated and the read is refused.",
+      "collectionGroup": "chats",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "participants", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "lastMessageTime", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "//": "Pinned messages: pinned equality filter + createdAt order. This query on chats/{chatId}/messages needs a composite index.",
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "pinned", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

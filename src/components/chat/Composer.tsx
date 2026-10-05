@@ -12,6 +12,7 @@ type ComposerProps = {
   showEmoji: boolean;
   showStickers: boolean;
   showVoice: boolean;
+  disabled?: boolean;
 };
 
 export const Composer = ({
@@ -23,12 +24,13 @@ export const Composer = ({
   showEmoji,
   showStickers,
   showVoice,
+  disabled = false,
 }: ComposerProps) => {
   const [messageText, setMessageText] = useState('');
   const inputRef = useRef<TextInput>(null);
 
   const handleSend = () => {
-    if (!messageText.trim()) return;
+    if (!messageText.trim() || disabled) return;
     onSendText(messageText.trim());
     setMessageText('');
   };
@@ -38,6 +40,7 @@ export const Composer = ({
       <TouchableOpacity
         style={styles.iconButton}
         onPress={onOpenEmoji}
+        disabled={disabled}
       >
         <Ionicons
           name="happy-outline"
@@ -49,6 +52,7 @@ export const Composer = ({
       <TouchableOpacity
         style={styles.iconButton}
         onPress={onOpenStickers}
+        disabled={disabled}
       >
         <Ionicons
           name="image-outline"
@@ -63,14 +67,16 @@ export const Composer = ({
         placeholder="Type a message..."
         placeholderTextColor={COLORS.placeholder}
         value={messageText}
-        onChangeText={setMessageText}
+        onChangeText={disabled ? undefined : setMessageText}
         onSubmitEditing={handleSend}
         returnKeyType="send"
+        editable={!disabled}
       />
 
       <TouchableOpacity
         style={styles.iconButton}
         onPress={onOpenVoice}
+        disabled={disabled}
       >
         <Ionicons
           name="mic-outline"
@@ -82,7 +88,7 @@ export const Composer = ({
       <TouchableOpacity
         style={[styles.iconButton, styles.sendButton]}
         onPress={handleSend}
-        disabled={!messageText.trim()}
+        disabled={disabled || !messageText.trim()}
       >
         <Ionicons name="send" size={20} color="white" />
       </TouchableOpacity>

@@ -25,6 +25,7 @@ export interface Message {
   replyTo?: { messageId: string; text: string; senderName: string };
   createdAt: number;
   readBy?: string[];
+  isBot?: boolean;
 }
 
 export interface Room {

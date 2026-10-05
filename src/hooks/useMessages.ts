@@ -7,7 +7,6 @@ import {
   limit,
   onSnapshot,
   addDoc,
-  serverTimestamp,
   doc,
   updateDoc,
   arrayUnion,
@@ -36,11 +35,10 @@ function mapMessage(docSnap: any): Message {
 
 export function useMessages(roomId: string) {
   const [messages, setMessages] = useState<Message[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!!roomId);
   const myUidRef = useRef('');
 
   useEffect(() => {
-    let cancelled = false;
     (async () => {
       try {
         const profile = await getCurrentUserProfile();
@@ -49,15 +47,10 @@ export function useMessages(roomId: string) {
         // not authenticated
       }
     })();
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
   useEffect(() => {
     if (!roomId) {
-      setMessages([]);
-      setLoading(false);
       return;
     }
 
@@ -81,7 +74,7 @@ export function useMessages(roomId: string) {
   }, [roomId]);
 
   const sendMessage = useCallback(
-    async (type: Message['type'], data: { text?: string; mediaUrl?: string; durationSeconds?: number; stickerName?: string }) => {
+    async (type: Message['type'], data: { text?: string; mediaUrl?: string; durationSeconds?: number; stickerName?: string; isBot?: boolean }) => {
       const profile = await getCurrentUserProfile();
       const message: Message = {
         id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,

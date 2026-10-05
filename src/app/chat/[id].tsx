@@ -1,15 +1,17 @@
-import { View, Text, FlatList, StyleSheet, KeyboardAvoidingView, Platform } from 'react-native';
-import { useEffect, useState, useRef } from 'react';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useMessages } from '../../hooks/useMessages';
-import { useCurrentUser } from '../../hooks/useCurrentUser';
-import { MessageBubble } from '../../components/chat/MessageBubble';
+import { useEffect, useRef, useState } from 'react';
+import { Alert, FlatList, KeyboardAvoidingView, Platform, StyleSheet, Text, View } from 'react-native';
 import { ChatHeader } from '../../components/chat/ChatHeader';
 import { Composer } from '../../components/chat/Composer';
+import { MessageBubble } from '../../components/chat/MessageBubble';
 import { EmojiPicker } from '../../components/emoji/EmojiPicker';
 import { StickerGrid } from '../../components/emoji/StickerGrid';
 import { VoiceRecorder } from '../../components/voice/VoiceRecorder';
+import { useCurrentUser } from '../../hooks/useCurrentUser';
+import { useMessages } from '../../hooks/useMessages';
 import { COLORS } from '../../lib/constants';
+
+const AI_API_URL = 'http://192.168.1.12:3000/api/chat';
 
 export default function ChatScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -19,6 +21,7 @@ export default function ChatScreen() {
   const [showEmoji, setShowEmoji] = useState(false);
   const [showStickers, setShowStickers] = useState(false);
   const [showVoice, setShowVoice] = useState(false);
+  const [isBotReplying, setIsBotReplying] = useState(false);
   const flatListRef = useRef<FlatList>(null);
 
   useEffect(() => {
@@ -31,13 +34,50 @@ export default function ChatScreen() {
   }, [messages, currentUser?.uid, markAsRead]);
 
   const handleSendText = async (text: string) => {
+    if (!text.trim()) return;
+
+    // 1. User sends message
     await sendMessage('text', { text });
     setShowEmoji(false);
     setShowStickers(false);
+
+    // 2. Call AI Server
+    setIsBotReplying(true);
+    try {
+      const response = await fetch(AI_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`AI Server error: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (!data.reply || typeof data.reply !== 'string') {
+        await sendMessage('text', {
+          text: data.error || 'AI did not return a valid response.',
+          isBot: true,
+        });
+        return;
+      }
+
+      // 3. Send AI response as bot message
+      await sendMessage('text', {
+        text: data.reply,
+        isBot: true,
+      });
+    } catch (error) {
+      console.error('AI Error:', error);
+      Alert.alert('AI Error', 'Could not get AI response. Check server connection.');
+    } finally {
+      setIsBotReplying(false);
+    }
   };
 
   const handleEmojiSelect = (emoji: string) => {
-    // Emoji is appended via the picker; for simplicity we send it directly
     sendMessage('text', { text: emoji });
     setShowEmoji(false);
   };
@@ -96,6 +136,12 @@ export default function ChatScreen() {
           />
         )}
 
+        {isBotReplying && (
+          <View style={styles.botTyping}>
+            <Text style={styles.botTypingText}>Bot is typing...</Text>
+          </View>
+        )}
+
         <Composer
           onSendText={handleSendText}
           onSendVoice={handleVoiceRecorded}
@@ -117,6 +163,7 @@ export default function ChatScreen() {
           showEmoji={showEmoji}
           showStickers={showStickers}
           showVoice={showVoice}
+          disabled={isBotReplying}
         />
       </KeyboardAvoidingView>
     </View>
@@ -143,5 +190,14 @@ const styles = StyleSheet.create({
   messagesContainer: {
     padding: 12,
     paddingBottom: 8,
+  },
+  botTyping: {
+    padding: 8,
+    alignItems: 'center',
+  },
+  botTypingText: {
+    fontSize: 13,
+    color: COLORS.textSecondary,
+    fontStyle: 'italic',
   },
 });

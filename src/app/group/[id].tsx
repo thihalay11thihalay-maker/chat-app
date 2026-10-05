@@ -1,20 +1,24 @@
-import { View, Text, FlatList, StyleSheet, KeyboardAvoidingView, Platform } from 'react-native';
+import { View, Text, FlatList, StyleSheet, KeyboardAvoidingView, Platform, TouchableOpacity } from 'react-native';
 import { useEffect, useState, useRef } from 'react';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { Ionicons } from '@expo/vector-icons';
 import { useMessages } from '../../hooks/useMessages';
 import { useCurrentUser } from '../../hooks/useCurrentUser';
+import { useRoom } from '../../hooks/useRoomList';
 import { MessageBubble } from '../../components/chat/MessageBubble';
 import { ChatHeader } from '../../components/chat/ChatHeader';
 import { Composer } from '../../components/chat/Composer';
 import { EmojiPicker } from '../../components/emoji/EmojiPicker';
 import { StickerGrid } from '../../components/emoji/StickerGrid';
 import { VoiceRecorder } from '../../components/voice/VoiceRecorder';
+import { Loading } from '../../components/common/Loading';
 import { COLORS } from '../../lib/constants';
 
-export default function ChatScreen() {
+export default function GroupChatScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const { user: currentUser } = useCurrentUser();
+  const { room, loading: roomLoading } = useRoom(id);
   const { messages, loading, sendMessage, markAsRead } = useMessages(id);
   const [showEmoji, setShowEmoji] = useState(false);
   const [showStickers, setShowStickers] = useState(false);
@@ -37,7 +41,6 @@ export default function ChatScreen() {
   };
 
   const handleEmojiSelect = (emoji: string) => {
-    // Emoji is appended via the picker; for simplicity we send it directly
     sendMessage('text', { text: emoji });
     setShowEmoji(false);
   };
@@ -55,10 +58,14 @@ export default function ChatScreen() {
     setShowVoice(false);
   };
 
+  if (roomLoading || loading) {
+    return <Loading />;
+  }
+
   return (
     <View style={styles.container}>
       <ChatHeader
-        title="Chat"
+        title={room?.name ?? 'Group Chat'}
         onBack={() => router.back()}
       />
 
@@ -67,9 +74,11 @@ export default function ChatScreen() {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
       >
-        {loading ? (
-          <View style={styles.loadingContainer}>
-            <Text style={styles.loadingText}>Loading messages...</Text>
+        {messages.length === 0 ? (
+          <View style={styles.emptyContainer}>
+            <Ionicons name="chatbubbles-outline" size={64} color={COLORS.placeholder} />
+            <Text style={styles.emptyText}>No messages yet</Text>
+            <Text style={styles.emptySubtext}>Say hello to the group!</Text>
           </View>
         ) : (
           <FlatList
@@ -131,14 +140,21 @@ const styles = StyleSheet.create({
   flex: {
     flex: 1,
   },
-  loadingContainer: {
+  emptyContainer: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
   },
-  loadingText: {
+  emptyText: {
+    fontSize: 18,
+    fontWeight: '600',
     color: COLORS.textSecondary,
+    marginTop: 16,
+  },
+  emptySubtext: {
     fontSize: 14,
+    color: COLORS.placeholder,
+    marginTop: 4,
   },
   messagesContainer: {
     padding: 12,

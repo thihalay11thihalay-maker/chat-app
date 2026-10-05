@@ -1,71 +1,39 @@
 {
-  "//": "Composite indexes for the feed. Firestore will serve each of the feed's four queries from a single-field index only if the filter and the order are on the same field, which none of them are: the home feed filters on visibility, userId or visibleToUids and orders by createdAt. Without these the listeners fail with FAILED_PRECONDITION / 'The query requires an index'. Deploy with: firebase deploy --only firestore:indexes",
   "indexes": [
     {
-      "//": "Public posts, newest first. Also serves the legacy query: Firestore's `== null` matches a missing field, and a null filter with an order on a different field needs its own index.",
-      "collectionGroup": "posts",
+      "collectionGroup": "messages",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "visibility", "order": "ASCENDING" },
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
+        { "fieldPath": "createdAt", "order": "ASCENDING" }
       ]
     },
     {
-      "//": "Your own posts, newest first. Needed whichever way round the two fields are combined.",
-      "collectionGroup": "posts",
+      "collectionGroup": "rooms",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "userId", "order": "ASCENDING" },
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "//": "Restricted posts you are in the audience of, newest first.",
-      "collectionGroup": "posts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "visibleToUids", "arrayConfig": "CONTAINS" },
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "//": "A profile's public posts, newest first. The feed's public query plus an equality on the author: two equality filters with an order on a third field cannot be served by any single-field index, so this triple is its own index.",
-      "collectionGroup": "posts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "visibility", "order": "ASCENDING" },
-        { "fieldPath": "userId", "order": "ASCENDING" },
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "//": "A profile's restricted posts that the viewer is in the audience of. Same shape as the restricted feed with the author narrowed onto it.",
-      "collectionGroup": "posts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "visibleToUids", "arrayConfig": "CONTAINS" },
-        { "fieldPath": "userId", "order": "ASCENDING" },
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "//": "The inbox. `array-contains` on participants combined with an order on a different field cannot be served by a single-field index, so this pair needs its own. The listener also has to pair it with the participants filter in the rules: without the filter the rules cannot be validated and the read is refused.",
-      "collectionGroup": "chats",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "participants", "arrayConfig": "CONTAINS" },
         { "fieldPath": "lastMessageTime", "order": "DESCENDING" }
       ]
     },
     {
-      "//": "Pinned messages: pinned equality filter + createdAt order. This query on chats/{chatId}/messages needs a composite index.",
-      "collectionGroup": "messages",
+      "collectionGroup": "users",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "pinned", "order": "ASCENDING" },
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
+        { "fieldPath": "geohash", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "friendRequests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "toUid", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "friendRequests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "fromUid", "order": "ASCENDING" }
       ]
     }
-  ],
-  "fieldOverrides": []
+  ]
 }

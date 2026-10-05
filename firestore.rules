@@ -1,36 +1,15 @@
 rules_version = '2';
 
-// Firestore security rules for the chat app.
+// Firestore security rules for BeeTalk chat app.
 //
-// Data model the client relies on:
-//   users/{uid}                     - profile, plus geohash/latitude/longitude for find-friends
-//   users/{uid}/following/{userId}  - who this account follows
-//   users/{uid}/followers/{userId}  - who follows this account, written by the follower
-//   posts/{postId}                  - feed posts
-//   posts/{postId}/reactions/{uid}  - { liked, loved } per reacting account
-//   posts/{postId}/comments/{id}    - { userId, displayName, text, replyToName, parentId }
-//   chats/{chatId}                  - participants[], kind, name, about, avatarUrl, ownerId,
-//                                      lastMessage, unreadCounts, ...
-//   chats/{chatId}/messages/{msgId} - senderId, type, text/mediaUrl
+// Data model:
+//   users/{uid}                    - profile, geohash/latitude/longitude for nearby
+//   rooms/{roomId}                 - participants[], kind, name, ownerId, lastMessage
+//   rooms/{roomId}/messages/{msgId} - senderId, type, text/mediaUrl
+//   friendRequests/{requestId}     - fromUid, toUid, status
 //
 // Deploy from a terminal with:  npm run deploy:rules
-//
-// That command deliberately includes firestore:indexes. The `chats` list rule requires a `participants`
-// filter to be provable and the inbox orders by `lastMessageTime`, so the inbox and profile feeds depend
-// on composite indexes that live in firestore.indexes.json. A rules-only deploy lands the tightened rules
-// while those indexes are still building, and every one of those listeners then fails at runtime with
-// FAILED_PRECONDITION -- for everybody, immediately, and looking like an app bug rather than a deploy one.
-//
-// Before deploying rules that make `visibility` meaningful, run the migration they depend on:
-//
-//     npm run backfill:visibility
-//     npm run deploy:rules
-//
-// The rules deliberately do not treat a missing `visibility` as public inside a list rule, because in a
-// query `resource` is null and such a clause authorizes an unfiltered read of the whole collection. The
-// comment on the posts block explains that in full; scripts/backfill-visibility.js is the other half.
-//
-// Anything not matched below is denied.
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -44,753 +23,113 @@ service cloud.firestore {
       return signedIn() && request.auth.uid == uid;
     }
 
-    // A chat document belongs to the accounts listed in its participants.
-    function inChat(chatId) {
+    // A room document belongs to the accounts listed in its participants.
+    function inRoom(roomId) {
       return signedIn()
-        && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.participants;
     }
 
-    // Who owns a room: the account that created it. Absent on the rooms written before groups could be
-    // named, which is why every owner test below falls back to "anybody in the room" when the field is
-    // not there. Without that fallback an old room would become uneditable and undeletable.
+    // Who owns a room: the account that created it.
     function ownsRoom(room) {
       return 'ownerId' in room && room.ownerId == request.auth.uid;
-    }
-
-    // Who may run the room: its owner, or one of its admins.
-    //
-    // `admins` is absent on rooms written before roles existed, so the membership test is guarded rather
-    // than assumed, and an owner with no admins list is still an owner. The two are read together because
-    // every moderation grant below needs both answers, and a rule that reads one without the other is how
-    // a half-built role system ends up granting less than it reads like it does.
-    function isRoomAdmin(room) {
-      return 'admins' in room && request.auth.uid in room.admins;
-    }
-
-    function managesRoom(room) {
-      return signedIn() && (ownsRoom(room) || isRoomAdmin(room));
-    }
-
-    // Whether an account may post into a room.
-    //
-    // A channel is one way: the owner announces and everybody else reads. Admins may post as well, or an
-    // admin could be handed the member list and the room's settings and be unable to answer anybody in the
-    // room itself, which is not a role anybody wants. A group has no such rule, and neither does a room
-    // with no `kind` at all, which is every room written before kinds existed. This is the only reason a
-    // channel needs the read to happen at all: without it a channel would be a group with a different name,
-    // and the member list screen would be showing a permission that did not exist.
-    //
-    // A `get()` on the room rather than `resource`, because the room document is not what is being written
-    // here: the message is. The path is fixed, so this costs one read per message write and is still
-    // provable for the reads that come with it.
-    function canPostInRoom(chatId) {
-      let room = get(/databases/$(database)/documents/chats/$(chatId)).data;
-
-      return !('kind' in room)
-        || room.kind != 'channel'
-        || managesRoom(room);
-    }
-
-    // The room document is several different records written by several different people, so an update
-    // rule cannot simply say "a member may update the room". Each of these is the set of fields one of
-    // them is allowed to touch, and the update rule below is the set of them joined.
-    //
-    // Anything a member does to the room as it happens. The preview the inbox reads, and a member's own
-    // unread counter, which is why `unreadCounts` is here as a whole rather than as `unreadCounts.<uid>`:
-    // a dotted path is not a field name to `affectedKeys()`, which only ever reports the top level. That is
-    // also why this cannot be narrowed per member, and it does not need to be: a member can only ever
-    // move their own counter up, since the client that writes it derives the uid from the signed in account.
-    // `lastActive` is the same idea for the stats screen: a member's own timestamp of their last message.
-    function roomActivityOnly() {
-      return request.resource.data.diff(resource.data).affectedKeys()
-        .hasOnly(['lastMessage', 'lastMessageSenderId', 'lastMessageTime', 'unreadCounts', 'lastActive']);
-    }
-
-    // What the owner or an admin may say about the room. Kept apart from the fields above on purpose: a
-    // name is what the room is called in the inbox, so letting any member rewrite it would let any member
-    // rename a room to something misleading for everybody else in it.
-    //
-    // `privacy` and `inviteCode` are here because they are what the room is rather than what is happening
-    // in it. The code's length is deliberately not constrained: turning invites off writes an empty string,
-    // and this rule has no reason to have an opinion about how long a code is.
-    function roomDescriptionOnly() {
-      return request.resource.data.diff(resource.data).affectedKeys()
-        .hasOnly(['name', 'about', 'avatarUrl', 'privacy', 'inviteCode']);
-    }
-
-    // Who may run the room: the admin list and the ban list.
-    //
-    // Split from the description fields and from the membership change below so each can be required on
-    // its own: being allowed to remove a member is not thereby being allowed to ban one, and being allowed
-    // to rename the room is not being allowed to hand the room to somebody else.
-    function roomModerationOnly() {
-      return request.resource.data.diff(resource.data).affectedKeys()
-        .hasOnly(['admins', 'banned']);
-    }
-
-    // Membership, as a manager changes it.
-    //
-    // Checked as a superset rather than as a diff, because a manager may add or remove any number of
-    // people at once and the point of the test is not the arithmetic but the four things it must not
-    // allow: the caller must end up in the room, the owner must survive the write, the room must stay
-    // owned by the same account, and the list must not grow without bound, which is what stops this
-    // being a way to write somebody else's room.
-    //
-    // The ownership clause is here rather than in its own grant because this is the only branch that
-    // can carry `ownerId` through an otherwise permitted write: the description and moderation grants
-    // are both closed over a list of fields it is not in, and this one deliberately is not, so without
-    // the clause an admin could hand the room to somebody else by moving one participant and the owner
-    // field along with it.
-    function isManagingMembership(chatId) {
-      let room = get(/databases/$(database)/documents/chats/$(chatId)).data;
-
-      return signedIn()
-        && managesRoom(room)
-        && request.resource.data.participants is list
-        && request.resource.data.participants.size() >= 1
-        // The owner is not removable by an admin, and an owner cannot remove themselves out of ownership.
-        && (!('ownerId' in room) || request.resource.data.participants.hasAll([room.ownerId]))
-        && (!('ownerId' in room)
-          || (!('ownerId' in request.resource.data) || request.resource.data.ownerId == room.ownerId))
-        && request.resource.data.participants.hasAll(
-             room.participants.removeAll(request.resource.data.participants))
-        && request.resource.data.participants.size() <= room.participants.size() + 50;
-    }
-
-    // Joining by invite link.
-    //
-    // A public room with a code can be joined by anybody with an account, which is what a public room is
-    // for. The write is checked against the stored list rather than trusted, so this cannot be used to
-    // rewrite a membership: the new list has to be the old one plus the caller and nothing else, which
-    // means the same write cannot be used to drop anybody, and a client that never read the room cannot
-    // produce the list at all.
-    //
-    // A private room is refused, and so is somebody on the ban list. Both are re-checked here rather than
-    // taken from the screen, because the link that got somebody here was handed to them by somebody else
-    // and the room's own state is the only thing that gets a say.
-    function isJoiningRoom(chatId) {
-      let room = get(/databases/$(database)/documents/chats/$(chatId)).data;
-
-      return signedIn()
-        && room.privacy == 'public'
-        && 'inviteCode' in room && room.inviteCode is string && room.inviteCode != ''
-        && !('banned' in room && request.auth.uid in room.banned)
-        && request.resource.data.participants is list
-        && !(request.auth.uid in room.participants)
-        && request.auth.uid in request.resource.data.participants
-        && request.resource.data.participants.size() == room.participants.size() + 1
-        && request.resource.data.participants.hasAll(room.participants);
-    }
-
-    // Leaving, which is the one participant list change that is allowed.
-    //
-    // The list was pinned to being immutable, which made leaving impossible and left people able to delete
-    // a room they were only ever a passenger in. What is checked is exactly one thing: the new list is the
-    // old one minus the caller, nothing else. So somebody cannot drop another member on the way out, and
-    // cannot add themselves to somebody else's room by rewriting it to include them.
-    function isLeavingRoom() {
-      return 'participants' in resource.data
-        && request.auth.uid in resource.data.participants
-        && request.resource.data.participants is list
-        && !(request.auth.uid in request.resource.data.participants)
-        && request.resource.data.participants.size() == resource.data.participants.size() - 1
-        && request.resource.data.participants
-          .hasAll(resource.data.participants.removeAll([request.auth.uid]));
-    }
-
-    // Reading a comment or a reaction is really reading the post it hangs off, so this is the post's
-    // own test rather than a second, looser one. Without it, a private post's comments and reaction
-    // flags would stay open to anyone who knows the post id.
-    //
-    // A post is governed by two fields written together at post time:
-    //   visibility    - public | followers_friends | friends_only | only_me
-    //   visibleToUids - the accounts allowed to read it, snapshotted from the author's follow list
-    //                   when it was published
-    //
-    // The audience is denormalised onto the document on purpose. Firestore refuses any collection
-    // query whose rule depends on the individual document, so a rule phrased as "readable if you
-    // follow the author" can protect a `get` but can never let a feed query through at all. With the
-    // audience in an array, the check becomes an `in` on a field the query can filter on. See
-    // buildAudience() in src/lib/upload-post.ts for what the list is and what the snapshot costs.
-    //
-    // The trade-off: `visibleToUids` is frozen at publish time, so a new follower does not gain older
-    // restricted posts. Making that live needs a trusted server maintaining the list.
-    function canReadPost(postId) {
-      let post = get(/databases/$(database)/documents/posts/$(postId)).data;
-
-      return (!('visibility' in post) || post.visibility == 'public')
-        || (
-          signedIn()
-          && (
-            post.userId == request.auth.uid
-            // `visibleToUids` is guarded before it is read. `||` does short circuit, so the author's own branch
-            // would get here without evaluating it, but reading a field that is not there is a rule
-            // error and a rule that errors denies. The guard keeps the branch saying what it means.
-            || ('visibleToUids' in post && request.auth.uid in post.visibleToUids)
-          )
-        );
     }
 
     // ------------------------------------------------------------------- users
 
     match /users/{uid} {
-      // Any signed-in account may read a profile: the chat list shows the other participant's name
-      // and avatar, and find-friends reads age, city and geohash.
+      // Any signed-in account may read a profile: the chat list shows the other
+      // participant's name and avatar, and nearby friends reads geohash.
       allow get, list: if signedIn();
 
       // A profile is the account's own to write.
       allow create, update, delete: if owns(uid);
-
-      // Following is a per-author marker. Without this match every read fell through to the deny-all
-      // rule at the bottom.
-      match /following/{followedId} {
-        allow get, list: if owns(uid);
-        allow create, delete: if owns(uid);
-        allow update: if false;
-      }
-
-      // The mirror of `following`: one document per account that follows this one, so a profile can be
-      // asked how many followers somebody has.
-      //
-      // It exists because the rule above lets an account read only its own follow list. Without a
-      // mirror, "who follows this person" would take a collection-group query across every account in
-      // the app, which is denied, and which would hand every account the ability to enumerate the
-      // others in any case.
-      //
-      // The interesting part is the write. A follower is added by the follower, so without a check
-      // anybody could put themselves into any account's follower list and inflate any count. The check
-      // is that the writer's own follow document already exists, which is the only proof available to
-      // a client that the relationship is real: a rule can read the writer's side of the pair, and
-      // cannot invent the other side. Deleting is the same test in reverse -- you may only take
-      // yourself back out.
-      //
-      // Readable by any signed-in account, like the profiles themselves: the count is public in every
-      // app that shows one, and the document holds nothing but who and when.
-      match /followers/{followerId} {
-        allow get, list: if signedIn();
-        allow create: if signedIn()
-          && followerId == request.auth.uid
-          && exists(/databases/$(database)/documents/users/$(uid)/following/$(request.auth.uid));
-        allow delete: if signedIn() && followerId == request.auth.uid;
-        allow update: if false;
-      }
-
-      // This account's own settings for the rooms it is in: muted, notification sound, and how long
-      // messages live there.
-      //
-      // Under the account rather than on the room, because none of these are shared facts. A mute written
-      // on the room would mute it for everybody in it, and one person's disappearing-messages timer would
-      // delete what everybody else can still read. Held to its own owner, so nothing here widens what a
-      // member can do to a room, and so a room's own rules never have to make an exception for it.
-      match /chatSettings/{chatId} {
-        allow get, list, create, update, delete: if owns(uid);
-      }
     }
 
-    // ------------------------------------------------------- friend requests
+    // ------------------------------------------------------------ friend requests
 
-    // One document per pair of people, at friendRequests/{uidA}___{uidB} with the two uids sorted.
-    //
-    // Both sides of a request have to be able to see it -- the sender wants to know it went, the receiver
-    // has to be able to answer it -- and that is the whole reason for a shared document rather than a
-    // per-account subcollection. A subcollection would mean the sender could only read their own copy, so
-    // either a second document has to be written and the two could drift, or the sender never learns that
-    // their request was accepted.
-    //
-    // The two grants are split because two different people may change two different things about a
-    // request, and the difference is the point. The sender may send it and take it back; only the receiver
-    // may answer it. Nobody edits anybody's request into an acceptance, and in particular the sender
-    // cannot accept their own -- which is the one thing a naive "the writer may update the status" rule
-    // would allow, and would make every friendship in the app a self-follow.
     match /friendRequests/{requestId} {
-      // Both parties, and nothing else. Firestore evaluates this per document, so a query that does not
-      // filter on one of these fields is refused: a client asking for every request in the app would be
-      // handed the documents that pass and refused on the rest, which is the behaviour the rule below
-      // relies on the callers honouring with a `where` clause.
+      // Both parties, and nothing else.
       allow get, list: if signedIn()
-        && (resource.data.from == request.auth.uid || resource.data.to == request.auth.uid);
+        && (resource.data.fromUid == request.auth.uid || resource.data.toUid == request.auth.uid);
 
-      // A request has to come from the account writing it, go to somebody else, and arrive unanswered.
-      //
-      // The last part is what stops a re-send from quietly undoing an existing friendship: without it, a
-      // client could write `status: 'pending'` over an accepted request and turn two friends back into a
-      // pending row that nobody is told about. A create is a new document, so `resource` does not exist
-      // here and there is no previous status to check -- this only prevents forging one from scratch, and
-      // the update rule below is what protects the real one.
+      // A request has to come from the account writing it, go to somebody else,
+      // and arrive unanswered.
       allow create: if signedIn()
-        && request.resource.data.from == request.auth.uid
-        && request.resource.data.to != request.auth.uid
+        && request.resource.data.fromUid == request.auth.uid
+        && request.resource.data.toUid != request.auth.uid
         && request.resource.data.status == 'pending';
 
-      // Two different people may change two different things about a request, and the difference is the
-      // point. Only the receiver may answer it, and only the sender may re-send it.
-      //
-      // The sender's branch exists because asking again is an update and not a create: the document for
-      // this pair already exists, and it is written with a merge so the row is reused rather than
-      // duplicated. Without this branch, a request that had been declined could never be sent again --
-      // the receiver's branch would refuse it, and so would everything else.
-      //
-      // That branch is held to two things so it cannot be used to take a friendship apart. It may only
-      // write the answer and the sender's own details, which keeps `from` and `to` immutable -- otherwise
-      // accepting a request could also rewrite it into a request from somebody else. And it refuses to
-      // touch a request that is already accepted: a sender who could reset an accepted request to pending
-      // could remove themselves from the other person's friend list at will, because the accepted row is
-      // what makes them a friend.
-      allow update: if signedIn() && (
-        (
-          resource.data.to == request.auth.uid
-          && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['status', 'updatedAt'])
-          && request.resource.data.status in ['accepted', 'declined']
-        )
-        || (
-          resource.data.from == request.auth.uid
-          && resource.data.status != 'accepted'
-          && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['status', 'updatedAt', 'createdAt', 'fromName', 'fromPhotoUrl'])
-          && request.resource.data.status == 'pending'
-        )
-      );
+      // Only the receiver may answer it.
+      allow update: if signedIn()
+        && resource.data.toUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'createdAt'])
+        && request.resource.data.status in ['accepted', 'rejected'];
 
-      // Either side may remove it: the receiver to clear a request off their list without answering it,
-      // the sender to take it back. Nobody may remove a request they are not part of.
-      //
-      // But not once it has been accepted, and the reason is the same one the update branch above is
-      // careful about: the accepted row *is* the friendship. Deleting it does not undo a request, it
-      // removes the sender from the receiver's friend list with no action from the receiver at all, which is
-      // precisely the outcome that branch exists to prevent. So the delete is refused on an accepted
-      // request, and ending a friendship has to go through the mutual flow rather than through one side
-      // deleting a row.
+      // Either side may remove it, but not once accepted.
       allow delete: if signedIn()
         && resource.data.status != 'accepted'
-        && (resource.data.from == request.auth.uid || resource.data.to == request.auth.uid);
+        && (resource.data.fromUid == request.auth.uid || resource.data.toUid == request.auth.uid);
     }
 
-    // ------------------------------------------------------------ phone index
+    // ------------------------------------------------------------------- rooms
 
-    // phoneIndex/{sha256 of the last nine digits} -> { uid }
-    //
-    // This is how "people you know" works without either side handing over its address book: a device
-    // hashes the numbers it has and asks whether each hash belongs to somebody here.
-    //
-    // It is its own collection rather than a field on the profile for one reason: `get` is allowed and
-    // `list` is not. A document id cannot be enumerated, so a client can only ask about a number it
-    // already holds -- the index answers "is this specific number registered" and cannot be walked to
-    // collect the numbers of everybody in the app. A `phoneHash` array on the profile could not do that,
-    // because profiles are readable by every signed-in account and Firestore has no field-level read
-    // rules.
-    //
-    // What this does not do is make the numbers private against somebody who already has them. A SHA-256
-    // of a phone number is not a password hash: the number space is small enough to confirm a guess
-    // offline. Hiding the digits raises the cost of reading the list rather than making it unreadable.
-    // Closing that properly needs an HMAC keyed on a secret no client holds, which needs a trusted
-    // server; until then this is a raised bar, not a locked door, and it is the reason the module that
-    // writes it says so.
-    match /phoneIndex/{hash} {
-      allow get: if signedIn();
+    match /rooms/{roomId} {
+      // A member may read their room.
+      allow get: if inRoom(roomId);
 
-      // Refused outright rather than left to the deny-all at the bottom, because this is the one place in
-      // these rules where "nobody may ask for all of it" is the interesting part and it should be said.
-      allow list: if false;
-
-      // No client may write here at all.
-      //
-      // The obvious rule -- allow a write when the document's uid equals the caller's uid -- does not hold,
-      // because the `{hash}` in the path is whatever the client computed and the rules cannot check it. A
-      // client can hash any number it likes and set its own uid under it, which both inserts the attacker
-      // into the real owner's address book and displaces the real owner. So the write is refused rather
-      // than merely guarded, and the only writer is meant to be a trusted server.
-      //
-      // That server does not exist yet: it needs to verify the number against the account (an OTP) and to
-      // hold the pepper that would make the hash non-reversible, neither of which a client can do. Until it
-      // does, nothing writes the index, so every sync finds nothing and costs one refused get per contact
-      // rather than leaking an address book. See src/lib/phone-index.ts for why that is the right half to
-      // ship and src/lib/friend-requests.ts for the same note from the caller's side.
-      allow create, update, delete: if false;
-    }
-
-    // ------------------------------------------------------------------- posts
-
-    match /posts/{postId} {
-      // A post with no visibility field predates this feature and is treated as public, which is what
-      // it was. Read through a guard rather than straight off `resource.data.visibility`, because
-      // reading a field that is not there is a rule error, and a rule that errors is a rule that denies.
-      function storedVisibility() {
-        return 'visibility' in resource.data ? resource.data.visibility : null;
-      }
-
-      // ------------------------------------------------------------------ read one document
-      //
-      // Here `resource` is the stored post, so the per-document test is available in full.
-      function isPublicDoc() {
-        let visibility = storedVisibility();
-        return visibility == null || visibility == 'public';
-      }
-
-      function isAuthorDoc() {
-        return signedIn() && resource.data.userId == request.auth.uid;
-      }
-
-      function isInAudienceDoc() {
-        return signedIn()
-          && 'visibleToUids' in resource.data
-          && request.auth.uid in resource.data.visibleToUids;
-      }
-
-      allow get: if isPublicDoc() || isAuthorDoc() || isInAudienceDoc();
-
-      // ------------------------------------------------------------------------ read a query
-      //
-      // Firestore checks a query before running it, by asking whether the query's own filters prove
-      // this rule for every document it might return. So each clause below is written to be provable
-      // from one filter, and the three feed queries each satisfy exactly one of them: the public feed
-      // by `visibility == 'public'`, a profile's posts by `userId == <me>`, and the restricted feed by
-      // `visibleToUids array-contains <me>`. Collapsing them into one expression makes every clause
-      // unprovable and every feed query fails with "Missing or insufficient permissions".
-      //
-      // Every clause is a *positive* test of one field. That is not stylistic. In a query there is no
-      // stored document, `resource` is null, and the engine reads any `'field' in resource.data` as
-      // "field absent". So a legacy-compatibility clause written as `!('visibility' in resource.data)`
-      // is true for *every* query, which authorizes an unfiltered `collection('posts')` for
-      // everybody, signed out included. Rules never filter the documents a query returns, so that one
-      // clause handed back the whole collection, `only_me` posts included, even though a direct read
-      // of those very documents is denied by `allow get` above. It is the one way a rule set that looks
-      // correct on paper leaks everything.
-      //
-      // So the compatibility case lives only in `allow get`, and the older posts are given
-      // `visibility: 'public'` before the rules are deployed, by a server script rather than by the app.
-      // See scripts/backfill-visibility.js, and see the ordering it prints:
-      //
-      //     1. npm run backfill:visibility
-      //     2. npm run deploy:fb
-      //     3. ship the build
-      //
-      // That order is not a preference. Deploy the rules first and every pre-existing post stops matching
-      // any feed clause, so it vanishes from every feed -- including from its author's own profile -- until
-      // that author happens to open the app on a build containing the backfill. The app's client-side
-      // backfill (src/hooks/use-visibility-backfill.ts) is a convenience that keeps the migration moving
-      // afterwards; it cannot be the thing that makes the deploy safe, because it runs too late and only
-      // for authors who sign in.
-      //
-      // A query cannot ask for "field absent" anyway: `where('visibility', '==', null)` matches those
-      // documents but is never accepted as proof, because `== null` also matches a field that is not there
-      // at all and "this field does not exist" cannot be shown to a rule.
-      function listIsPublic() {
-        return resource.data.visibility == 'public';
-      }
-
-      function listIsAuthor() {
-        return signedIn() && resource.data.userId == request.auth.uid;
-      }
-
-      function listIsInAudience() {
-        return signedIn() && request.auth.uid in resource.data.visibleToUids;
-      }
-
-      // A public post is readable by anyone, signed out included, which is what "public" is for. The
-      // other two clauses need an account, so a restricted post is never handed to an anonymous query.
-      allow list: if listIsPublic() || listIsAuthor() || listIsInAudience();
-
-      // A caller cannot invent an audience, and cannot write a visibility the app does not know.
-      // Checked on the value being written rather than the stored one.
-      allow create: if signedIn()
-        && request.resource.data.userId == request.auth.uid
-        && (
-          !('visibility' in request.resource.data)
-          || request.resource.data.visibility in ['public', 'followers_friends', 'friends_only', 'only_me']
-        )
-        && (
-          !('visibleToUids' in request.resource.data)
-          || request.resource.data.visibleToUids is list
-        );
-
-      // Either the author's, or a counter-only write from anyone whose changed fields are all
-      // counters. This used to be open to every signed-in account, because the share counter is
-      // written on every post including other people's, but that let anyone rewrite `userId` and
-      // `visibility` on a post they do not own, which would have made the read rules above decorative.
-      //
-      // Note the counters are deliberately not required to change: deleting a comment from a post
-      // whose counter is already 0 writes 0 over 0, and denying that would break an ordinary delete.
-      allow update: if isAuthorDoc()
-        || (
-          signedIn()
-          && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['shareCount', 'sharesCount', 'likesCount', 'lovesCount', 'commentsCount'])
-        );
-
-      // The author's alone, which is what the feed's options menu already hides behind an owner check.
-      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
-
-      // One document per reacting account, holding both the liked and loved flags. The feed counts
-      // these documents with a collection listener rather than keeping a counter on the post, so the
-      // numbers can never drift from the reactions themselves.
-      match /reactions/{userId} {
-        allow get: if signedIn() && request.auth.uid == userId;
-        allow create, update, delete: if signedIn() && request.auth.uid == userId;
-
-        // Counting reactions has to be possible for anyone who can see the post, because Firestore
-        // denies a collection query unless the rule allows it for every document. Read access is
-        // therefore no wider than the post's own audience, which is the same information the published
-        // count already implies.
-        allow list: if signedIn() && canReadPost(postId);
-      }
-
-      // Comments are read by everyone who can read the post, and written as their own author, the
-      // same split the reactions subcollection uses. A comment is immutable once written, so a reply
-      // cannot be made to impersonate somebody else.
-      match /comments/{commentId} {
-        allow get, list: if signedIn() && canReadPost(postId);
-
-        allow create: if signedIn()
-          && canReadPost(postId)
-          && request.resource.data.userId == request.auth.uid
-          && request.resource.data.text is string
-          && request.resource.data.text.size() > 0
-          && request.resource.data.text.size() <= 500;
-
-        allow update: if false;
-
-        // The author can take a comment back down. Replies go with the comment they hang under, so
-        // the second case lets the author of a comment also remove the replies underneath it, which
-        // are documents other people wrote. Without it a thread with replies could not be deleted at
-        // all: the replies would be denied and the whole transaction would fail. A reply is still
-        // only removable through its parent, never by anyone else.
-        //
-        // `parentId` is guarded before it is read. `||` does short circuit, so the author's own
-        // branch above would get here without evaluating it, but reading a field that is not there
-        // is a rule error and a rule that errors denies. The guard says which is which at a glance,
-        // and keeps the branch meaningful if the branch above it is ever reordered.
-        allow delete: if signedIn()
-          && (
-            resource.data.userId == request.auth.uid
-            || (
-              'parentId' in resource.data
-              && resource.data.parentId is string
-              && exists(/databases/$(database)/documents/posts/$(postId)/comments/$(resource.data.parentId))
-              && get(/databases/$(database)/documents/posts/$(postId)/comments/$(resource.data.parentId)).data.userId == request.auth.uid
-            )
-          );
-      }
-    }
-
-    // ------------------------------------------------------------------- chats
-
-    match /chats/{chatId} {
-      // A member may read their room. So may an account holding a link to a public room that has invites
-      // turned on, and that is the whole reason a join link works: somebody has to be able to see what
-      // they are joining before they are in it. It is deliberately narrower than membership -- privacy
-      // must be `public`, and the room must still have a live code -- and it covers this one document
-      // only, so the messages inside it stay closed until the join write lands.
-      allow get: if inChat(chatId) || (
-        signedIn()
-        && resource.data.privacy == 'public'
-        && 'inviteCode' in resource.data
-        && resource.data.inviteCode is string
-        && resource.data.inviteCode != ''
-      );
-
-      // Scoped to the caller's own conversations. This used to be `if signedIn()`, which let any
-      // signed-in account run `collection('chats')` and read every conversation in the app, including
-      // the participants and last messages of people who have never spoken to them.
-      //
-      // Firestore cannot see the query itself, only the document, so this rule is enforced by pairing
-      // it with a query that filters on the same field: a client asking for the wrong chats has the
-      // rule evaluated against a document it is not a participant in, and is refused. A query that
-      // leaves the participants filter off fails the same way, so the inbox cannot widen this by
-      // dropping the where clause. The same trick the post rules use for visibleToUids.
+      // Scoped to the caller's own conversations.
       allow list: if signedIn()
         && 'participants' in resource.data
         && request.auth.uid in resource.data.participants;
 
-      // The creator must be one of the participants, and there must be at least two of them. The floor
-      // was previously an exact two, which made group chats impossible to create at all even though
-      // the client and the feed both have a group filter.
-      //
-      // Relaxing this is a real loosening and worth being explicit about: an account can now create a
-      // room with an arbitrary set of people in it. Nobody can add anybody to an existing room, because
-      // the update rule below pins the participant list, so this is limited to rooms that account
-      // creates. A room is only reachable by the people in it, so the worst case is that somebody is
-      // dropped into a conversation they did not ask for. What they can do about it is leave, which the
-      // update rule allows, and what they cannot do is post afterwards: `canPostInRoom` reads the room's
-      // participants, so an account that is not in it is refused even by name.
-      // A room is created complete: who is in it, what kind of room it is, who owns it, whether it is
-      // open to a link, and the empty lists the moderation rules are written against.
-      //
-      // `ownerId` is written rather than inferred from the position of the creator in `participants`.
-      // "Whoever is first in the list" is a claim about how the client sorted an array, and it would make
-      // renaming or deleting the room depend on that sort rather than on who actually made it.
-      //
-      // The optional fields are validated only when present, because a direct chat needs none of them, but
-      // they are validated rather than ignored: without that, `kind` could be written as anything at all
-      // and the channel rule below would stop meaning anything.
-      //
-      // `admins`, `banned` and `privacy` are held to being lists and to the two privacy values when they
-      // are written, because every moderation rule above reads them as such. A creator who could not write
-      // `admins` at all would leave the field absent, and "is this account an admin" would then be a
-      // different question for a new room than for a room that has been running for a week.
+      // The creator must be one of the participants, and there must be at least two.
       allow create: if signedIn()
         && request.resource.data.participants is list
         && request.resource.data.participants.size() >= 2
         && request.auth.uid in request.resource.data.participants
         && request.resource.data.ownerId == request.auth.uid
-        && (!('admins' in request.resource.data)
-          || (request.resource.data.admins is list
-            // Parenthesised on purpose: `!uid in admins` parses as `(!uid) in admins`, which is a type
-            // error rather than a test, and a rule that errors denies. That denied *every* room
-            // creation, because every room writes an empty admin list.
-            && !(request.auth.uid in request.resource.data.admins)))
-        && (!('banned' in request.resource.data) || request.resource.data.banned is list)
-        && (!('privacy' in request.resource.data)
-          || request.resource.data.privacy in ['public', 'private'])
         && (!('kind' in request.resource.data)
-          || request.resource.data.kind in ['direct', 'group', 'channel'])
+          || request.resource.data.kind in ['direct', 'group'])
         && (!('name' in request.resource.data) || request.resource.data.name is string)
         && (!('about' in request.resource.data) || request.resource.data.about is string)
-        && (!('avatarUrl' in request.resource.data) || request.resource.data.avatarUrl is string)
-        && (!('inviteCode' in request.resource.data) || request.resource.data.inviteCode is string);
+        && (!('avatarUrl' in request.resource.data) || request.resource.data.avatarUrl is string);
 
-      // Several things can be written to a room, and each is a separate grant.
-      //
-      // The participant list is otherwise immutable, so nobody can add themselves to a chat later or pull
-      // somebody else into one. Three things may change it: a manager adding or removing people, the
-      // caller removing themselves, and an account with a link adding themselves to a public room.
-      allow update: if inChat(chatId) && (
-        roomActivityOnly()
-        || (managesRoom(resource.data) && roomDescriptionOnly())
-        || (managesRoom(resource.data) && roomModerationOnly())
-        || (managesRoom(resource.data) && isManagingMembership(chatId))
-        || isLeavingRoom()
-      ) || isJoiningRoom(chatId);
+      // Members may update the room's activity fields (last message preview).
+      // The owner may update the room's description.
+      allow update: if inRoom(roomId) && (
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['lastMessage', 'lastMessageSenderId', 'lastMessageTime', 'unreadCount'])
+        || (ownsRoom(resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['name', 'about', 'avatarUrl']))
+      );
 
-      // Deleting a room is the owner's call. It used to be any member's, which is why the profile screen
-      // offers it to the owner and shows leaving to everybody else. Rooms written before groups could be
-      // named carry no `ownerId`, and stay deletable by any member rather than becoming undeletable.
-      allow delete: if inChat(chatId)
+      // Deleting a room is the owner's call.
+      allow delete: if inRoom(roomId)
         && (!('ownerId' in resource.data) || ownsRoom(resource.data));
 
-      // The directory that makes an invite code findable is matched below the chats collection, because a
-      // code is resolved with a collection group query and that cannot be answered from a rule that names
-      // one parent path.
-
+      // Messages
       match /messages/{messageId} {
-        allow get, list: if inChat(chatId);
+        allow get, list: if inRoom(roomId);
 
-        // Only the owner or an admin of a channel can post into it, and only the sender's own name is
-        // accepted, so a message cannot be written into a room on somebody else's behalf. The rest is
-        // left open on purpose: a message carries a dozen optional fields -- a reply's preview, an expiry,
-        // the room it was forwarded from -- and validating each one here would mean every new kind of
-        // message is a rules deployment before it can be sent. Nothing in this grant lets a writer affect
-        // anything but the one message they are sending.
-        allow create: if inChat(chatId)
-          && request.resource.data.senderId == request.auth.uid
-          && canPostInRoom(chatId);
+        // Only a member may post, and only as themselves.
+        allow create: if inRoom(roomId)
+          && request.resource.data.senderId == request.auth.uid;
 
-        // Three separate grants, because three different people may change three different things about a
-        // message and the difference is the point:
-        //
-        //   the sender may fix the words, and only the words -- the timestamp of the edit travels with it,
-        //   and nothing else on the message can be rewritten in passing;
-        //   a manager may pin or unpin it, and may do so to somebody else's message, which is the whole
-        //   purpose of pinning;
-        //   nobody edits anybody's text.
-        //
-        // A previous version of this rule allowed any sender to update any field of their own message,
-        // which would have let anybody pin their own message.
-        allow update: if inChat(chatId) && (
-          (resource.data.senderId == request.auth.uid
-            && request.resource.data.diff(resource.data).affectedKeys()
-              .hasOnly(['text', 'editedAt']))
-          || (managesRoom(get(/databases/$(database)/documents/chats/$(chatId)).data)
-            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pinned']))
-        );
+        // The sender may edit their own message text.
+        allow update: if inRoom(roomId)
+          && resource.data.senderId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['text', 'createdAt']);
 
-        // A sender may retract their own message, and a manager may remove any message in the room, which
-        // is what "delete for everyone" means in a room they run.
-        //
-        // The third case is the disappearing-messages sweep. It is safe to allow anybody in the room to
-        // delete a message whose own `expiresAt` has already passed: the message is meant to be gone by
-        // then, so the only thing this permits is finishing what the timer started. A message with no
-        // expiry cannot be deleted this way, and neither can one that is still within its lifetime.
-        allow delete: if inChat(chatId) && (
-          resource.data.senderId == request.auth.uid
-          || managesRoom(get(/databases/$(database)/documents/chats/$(chatId)).data)
-          || (
-            'expiresAt' in resource.data
-            && resource.data.expiresAt is timestamp
-            && resource.data.expiresAt < request.time
-          )
-        );
-
-        // One document per reacting account, holding the emoji they chose.
-        //
-        // A subcollection rather than a map on the message, for the same reason posts use one: with a
-        // map, a member could add or remove somebody else's reaction, because a rule cannot compare one
-        // entry of a map against another. One document per person means the path itself is the permission,
-        // so nobody can touch a reaction that is not theirs. The message document is read for every
-        // reaction write, which is why this sits inside the chat rules where `inChat` is in scope.
-        match /reactions/{userId} {
-          allow get, list: if inChat(chatId);
-          allow create, update, delete: if inChat(chatId) && userId == request.auth.uid;
-        }
-      }
-
-      // --------------------------------------------------------------------- typing
-      //
-      // Who is typing, as `chats/{chatId}/typing/{uid} = { at }`.
-      //
-      // This was on the Realtime Database, and moving it here is a security change rather than a
-      // preference. `inChat` reads the room's own participants list, so "are you in this room" is a question
-      // these rules can answer. Realtime Database rules cannot read Firestore at all, which left the
-      // equivalent check as `auth != null` -- signed in is all. That is not a narrow gap: it let any account
-      // that learned a chat id read who was typing in that room for as long as the id was known, and write
-      // its own entry into it so members would watch a stranger appear to be typing. The old comment called
-      // that impractical on the grounds that document ids are random, which is an argument about the id and
-      // not about the room, and it stops holding the first time an id is shared, screenshotted, or seen by
-      // somebody who has since left.
-      //
-      // The write is as narrow as the read: an account may only write its own uid, and only into a room it is
-      // in. That second half matters as much as the first -- without it an outsider could announce itself
-      // into any conversation whose id it knew.
-      match /typing/{userId} {
-        allow get, list: if inChat(chatId);
-        allow create, update, delete: if inChat(chatId) && userId == request.auth.uid;
+        // The sender may delete their own message.
+        allow delete: if inRoom(roomId)
+          && resource.data.senderId == request.auth.uid;
       }
     }
 
     // ------------------------------------------------------------------ deny all
-
-    // The directory that makes an invite code findable: `chats/{chatId}/invites/{code}`.
-    //
-    // Matched with a recursive wildcard rather than inside `match /chats/{chatId}`, because a code is
-    // resolved with a collection group query over `invites` and that query is answered against a rule
-    // which does not name a single parent path. A rule written as `/chats/{chatId}/invites/{code}` looks
-    // like it covers these documents and does not: reading the same subcollection directly was allowed
-    // while the collection group query was refused by the catch-all below, so joining by link could only
-    // ever have failed. `**` matches any depth, which is what a collection group query spans.
-    //
-    // Readable by any signed-in account, and readable only one code at a time.
-    //
-    // `list` is granted but constrained: a rule that names `resource.data.code` makes Firestore require the
-    // query to filter on that field, so the only query that is answered is one that already holds the code
-    // being looked up. An unfiltered `collectionGroup('invites').get()` does not satisfy that and is
-    // refused, which is what stops it being a way to harvest every code and room id in the deployment. The
-    // earlier `allow get, list: if signedIn()` did satisfy it and was exactly that hole.
-    //
-    // The join flow (`joinRoomByInviteCode`) queries `where('code','==',...)`, so it is unaffected. The room
-    // it is about to enter is still checked by the join rule itself: a private room, a room with invites
-    // turned off, and a banned account are all still refused, so learning a code is not access.
-    match /{roomPath=**}/invites/{code} {
-      allow get: if signedIn();
-      allow list: if signedIn() && resource.data.code != null;
-
-      allow create, update: if signedIn()
-        && request.resource.data.code == code
-        && managesRoom(get(/databases/$(database)/documents/chats/$(request.resource.data.chatId)).data);
-
-      allow delete: if signedIn()
-        && resource.data.code == code
-        && managesRoom(get(/databases/$(database)/documents/chats/$(resource.data.chatId)).data);
-    }
 
     match /{document=**} {
       allow read, write: if false;
